@@ -14,10 +14,27 @@ A lightweight, customizable benchmark runner for `pi-coding-agent`, inspired by 
 
 ## Setup
 
-First, install the required dependencies (using `bun` or `npm`):
+First, install the required dependencies (using `bun` or `npm`). This installs `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` (the actively maintained fork of the original `@mariozechner/*` packages):
 ```bash
 bun install
 ```
+
+Then give the agent (and judge) something to authenticate with. You need at least one of:
+
+- **A local inference server** (`llama.cpp`, `ds4`, or `vllm`) — no auth needed, just configure the endpoint in [models.json](models.json) and pass `--provider`. See [Local Providers](#local-providers-llamacpp-ds4-and-vllm) below.
+- **A cloud provider API key** (OpenRouter, Anthropic, Google, etc.) — for local execution (`bun run src/index.ts` and the `run-swe-bench.sh` / `run-docker.sh` wrappers), credentials resolve through `pi-coding-agent`'s own credential store, in this order:
+  1. Stored credentials in `~/.pi/agent/auth.json` — the same file `pi auth login` writes to. If you already use `pi` (the coding agent CLI) with a provider configured, `pi-bench` picks it up automatically, no extra setup required.
+  2. Provider environment variables (e.g. `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`).
+  3. A `.env` file in the project root (only consumed by `run-docker.sh` / `run-swe-bench.sh`, which pass it into the container — it is **not** read by `bun run src/index.ts` directly).
+
+Verify everything is wired up with a trivial task before running a full suite:
+```bash
+bun run src/index.ts tasks/example-task.json \
+  --provider openrouter --model deepseek/deepseek-v4-flash \
+  --judge-model openrouter/deepseek/deepseek-v4-flash \
+  --timeout 4
+```
+A `[INFO] Score: 1` at the end means the agent, judge, and model auth are all working end-to-end.
 
 ## Defining Tasks
 
