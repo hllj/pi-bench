@@ -6,15 +6,20 @@ echo "[INFO] Building pi-bench docker image..."
 docker build -t pi-bench-runner .
 
 # Mount only the specific ~/.pi/agent resources pi-coding-agent's resource
-# loader discovers (extensions, skills, prompts, settings, context file),
-# each read-only. Deliberately NOT the whole ~/.pi/agent directory: auth.json,
-# sessions/, and models-store.json stay purely container-local -- the
-# credential store needs to create a short-lived auth.json.lock directory
-# even for reads that ultimately fall through to env vars, and a read-only
-# mount of the whole tree breaks that with EROFS.
+# loader discovers (extensions, skills, prompts, settings, context file, and
+# already npm-installed extension packages), each read-only. Deliberately
+# NOT the whole ~/.pi/agent directory: auth.json, sessions/, and
+# models-store.json stay purely container-local -- the credential store
+# needs to create a short-lived auth.json.lock directory even for reads that
+# ultimately fall through to env vars, and a read-only mount of the whole
+# tree breaks that with EROFS. Mounting npm/ read-only (rather than leaving
+# it unmounted) matters too: settings.json can declare npm: extension
+# sources (e.g. "npm:pi-lens"), and createAgentSession() tries to
+# `npm install` any that aren't already present -- these containers don't
+# have npm on PATH, so without this mount that install crashes the run.
 AGENT_DIR="$HOME/.pi/agent"
 RESOURCE_MOUNTS=""
-for name in extensions skills prompts agents settings.json AGENTS.md; do
+for name in extensions skills prompts agents settings.json AGENTS.md npm; do
     if [ -e "$AGENT_DIR/$name" ]; then
         RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $AGENT_DIR/$name:/root/.pi/agent/$name:ro"
     fi
