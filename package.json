@@ -9,8 +9,8 @@
     "dev": "bun run --watch src/index.ts"
   },
   "dependencies": {
-    "@mariozechner/pi-ai": "latest",
-    "@mariozechner/pi-coding-agent": "latest",
+    "@earendil-works/pi-ai": "latest",
+    "@earendil-works/pi-coding-agent": "latest",
     "zod": "^3.23.8"
   },
   "devDependencies": {

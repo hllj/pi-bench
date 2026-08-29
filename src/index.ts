@@ -1,10 +1,9 @@
 import {
-  AuthStorage,
   createAgentSession,
   ModelRegistry,
+  ModelRuntime,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
-import { getModel } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-coding-agent";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -75,10 +74,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     }
 
     console.log(`[INFO] Initializing agent session...`);
-    const authStorage = AuthStorage.create();
 
     const localModelsPath = join(process.cwd(), "models.json");
-    let modelRegistry;
+    let modelsPath: string | undefined;
     if (existsSync(localModelsPath)) {
       console.log(`[INFO] Using local models.json configuration`);
       if (port) {
@@ -89,9 +87,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         }
         const tmpModelsPath = tmpDir + "-models.json";
         await writeFile(tmpModelsPath, JSON.stringify(modelsData));
-        modelRegistry = ModelRegistry.create(authStorage, tmpModelsPath);
+        modelsPath = tmpModelsPath;
       } else {
-        modelRegistry = ModelRegistry.create(authStorage, localModelsPath);
+        modelsPath = localModelsPath;
       }
     } else {
       if (port) {
@@ -107,11 +105,12 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         };
         const tmpModelsPath = tmpDir + "-models.json";
         await writeFile(tmpModelsPath, JSON.stringify(modelsData));
-        modelRegistry = ModelRegistry.create(authStorage, tmpModelsPath);
-      } else {
-        modelRegistry = ModelRegistry.create(authStorage);
+        modelsPath = tmpModelsPath;
       }
     }
+
+    const modelRuntime = await ModelRuntime.create(modelsPath ? { modelsPath } : undefined);
+    const modelRegistry = new ModelRegistry(modelRuntime);
 
     let resolvedAgentModel;
     if (agentModelReq) {
@@ -120,7 +119,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         throw new Error(`Could not find model ${agentModelReq.provider}/${agentModelReq.id} in registry`);
       }
     } else {
-      const providerModels = modelRegistry.getAll().filter(m => m.provider === provider);
+      const providerModels = modelRegistry.getAll().filter((m: any) => m.provider === provider);
       if (providerModels.length > 0) {
         resolvedAgentModel = providerModels[0];
         console.log(`[INFO] No agent model specified, defaulting to ${resolvedAgentModel.provider}/${resolvedAgentModel.id}`);
@@ -136,8 +135,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     const { session } = await createAgentSession({
       cwd: tmpDir,
       sessionManager: SessionManager.inMemory(tmpDir),
-      authStorage,
-      modelRegistry,
+      modelRuntime,
       model: resolvedAgentModel,
     });
 
@@ -456,7 +454,14 @@ ${task.prompt}`;
     }
 
     console.log(`[INFO] Running LLM judge...`);
-    const judgeModel = judgeModelReq || session.state.model;
+    let judgeModel = session.state.model;
+    if (judgeModelReq) {
+      const resolvedJudgeModel = modelRegistry.find(judgeModelReq.provider, judgeModelReq.id);
+      if (!resolvedJudgeModel) {
+        throw new Error(`Could not find judge model ${judgeModelReq.provider}/${judgeModelReq.id} in registry`);
+      }
+      judgeModel = resolvedJudgeModel;
+    }
     if (!judgeModel) throw new Error("Judge model not found");
     const auth = await modelRegistry.getApiKeyAndHeaders(judgeModel);
     if (!auth.ok) throw new Error("Judge auth failed: " + auth.error);
@@ -509,8 +514,7 @@ ${testResultsSection}
 `;
 
     let judgeOutput = "";
-    const { streamSimple } = await import("@mariozechner/pi-ai");
-    const stream = streamSimple(judgeModel, {
+    const stream = modelRuntime.streamSimple(judgeModel, {
       systemPrompt: judgeSystemPrompt,
       messages: [{ role: "user", content: judgePrompt, timestamp: Date.now() }]
     }, { apiKey: auth.apiKey, headers: auth.headers });
@@ -625,8 +629,8 @@ async function main() {
   let judgeModelReq;
   if (values["judge-model"]) {
     const parts = values["judge-model"].split("/");
-    judgeModelReq = parts.length > 1 ? getModel(parts[0] as any, parts[1]) : undefined;
-    if (!judgeModelReq && !values["print-output-dir"]) console.warn(`[WARN] Could not resolve judge model ${values["judge-model"]}. Using default.`);
+    judgeModelReq = parts.length > 1 ? { provider: parts[0] as any, id: parts.slice(1).join("/") } : undefined;
+    if (!judgeModelReq && !values["print-output-dir"]) console.warn(`[WARN] Could not parse judge model ${values["judge-model"]} (expected provider/model-id). Using default.`);
   }
 
   const modelTag = values["model-tag"] as string | undefined;
