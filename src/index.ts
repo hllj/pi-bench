@@ -457,10 +457,11 @@ ${task.prompt}`;
     let judgeModel = session.state.model;
     if (judgeModelReq) {
       const resolvedJudgeModel = modelRegistry.find(judgeModelReq.provider, judgeModelReq.id);
-      if (!resolvedJudgeModel) {
-        throw new Error(`Could not find judge model ${judgeModelReq.provider}/${judgeModelReq.id} in registry`);
+      if (resolvedJudgeModel) {
+        judgeModel = resolvedJudgeModel;
+      } else {
+        console.warn(`[WARN] Could not resolve judge model ${judgeModelReq.provider}/${judgeModelReq.id}. Using default.`);
       }
-      judgeModel = resolvedJudgeModel;
     }
     if (!judgeModel) throw new Error("Judge model not found");
     const auth = await modelRegistry.getApiKeyAndHeaders(judgeModel);
