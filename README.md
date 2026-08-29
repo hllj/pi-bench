@@ -200,6 +200,9 @@ bun run src/index.ts tasks/curated/easy.json
 | `--context <tokens>` | Override model context window size for this run | From `models.json` |
 | `--timeout <minutes>` | Agent timeout per task | `30` |
 | `--pass <N>` | Number of attempts to make per task (retries on failure) | `1` |
+| `--exclude-tools <list\|none>` | Comma-separated tool names to disable, or `none` to allow everything | `web_search,web_fetch` |
+
+`--exclude-tools` defaults to disabling `web_search` and `web_fetch` (if your `~/.pi/agent` extensions register them) so the agent can't look up the real upstream fix online instead of solving the task — pass `--exclude-tools none` to allow all tools, or your own comma-separated list to disable a different set.
 
 ### Examples
 

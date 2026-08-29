@@ -44,7 +44,7 @@ function buildSweTestCommand(task: any): string {
   return `cd /testbed && ${python} -m pytest --tb=short`;
 }
 
-async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number) {
+async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[]) {
   const taskContent = await readFile(taskFile, "utf-8");
   const task = JSON.parse(taskContent);
 
@@ -137,6 +137,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       sessionManager: SessionManager.inMemory(tmpDir),
       modelRuntime,
       model: resolvedAgentModel,
+      excludeTools: excludeTools && excludeTools.length > 0 ? excludeTools : undefined,
     });
 
     console.log(`[INFO] Agent resolved to model: ${session.model?.provider}/${session.model?.id}`);
@@ -600,16 +601,35 @@ async function main() {
       port: { type: "string" },
       "inference-profile": { type: "string" },
       "print-output-dir": { type: "boolean" },
+      "exclude-tools": { type: "string" },
     },
     allowPositionals: true,
   });
+
+  // Tools disabled by default for benchmark integrity: an agent that can search
+  // or fetch the web could just look up the real upstream fix instead of
+  // solving the task. Pass --exclude-tools with a comma-separated list to
+  // override (e.g. "none" to allow everything, or a different tool list).
+  const DEFAULT_EXCLUDED_TOOLS = ["web_search", "web_fetch"];
+  let excludeTools: string[];
+  if (values["exclude-tools"] !== undefined) {
+    const raw = (values["exclude-tools"] as string).trim();
+    excludeTools = raw === "" || raw.toLowerCase() === "none"
+      ? []
+      : raw.split(",").map((t) => t.trim()).filter(Boolean);
+  } else {
+    excludeTools = DEFAULT_EXCLUDED_TOOLS;
+  }
+  if (excludeTools.length > 0) {
+    console.log(`[INFO] Excluding tools: ${excludeTools.join(", ")}`);
+  }
 
   // --provider takes precedence, --engine is a backward-compat alias
   const provider = (values.provider || values.engine || "llama.cpp") as string;
 
   const targetPath = positionals[0];
   if (!targetPath && !values["print-output-dir"]) {
-    console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params]");
+    console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params] [--exclude-tools web_search,web_fetch|none]");
     process.exit(1);
   }
 
@@ -740,7 +760,7 @@ async function main() {
       console.warn(`[WARN] Could not pre-parse task file ${f} for resume check.`);
     }
 
-    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride);
+    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools);
     results.push(res);
     if (res.judgeScore === 1) passed++;
     totalDuration += res.durationMs;
