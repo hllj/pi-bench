@@ -38,6 +38,23 @@ PI_BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Create persistent bun cache volume (shared across all container runs)
 docker volume create pi-bench-bun-cache 2>/dev/null || true
 
+# Ensure ~/.pi/agent exists on the host so it can be bind-mounted (read-only)
+# into each container, giving pi-coding-agent access to the user's global
+# extensions, skills, prompts, and settings.json.
+mkdir -p "$HOME/.pi/agent"
+
+# ~/.pi/agent/extensions is commonly a symlink into a separate config repo
+# (e.g. ~/pi-config). A bind mount doesn't rewrite symlink targets, so mount
+# the real target at its identical absolute path too, or the symlink dangles
+# inside the container.
+EXTENSIONS_MOUNT=""
+if [ -L "$HOME/.pi/agent/extensions" ]; then
+  REAL_EXT_DIR="$(cd -P "$HOME/.pi/agent/extensions" 2>/dev/null && pwd)"
+  if [ -n "$REAL_EXT_DIR" ] && [ "$REAL_EXT_DIR" != "$HOME/.pi/agent/extensions" ]; then
+    EXTENSIONS_MOUNT="-v $REAL_EXT_DIR:$REAL_EXT_DIR:ro"
+  fi
+fi
+
 # Collect env file args
 ENV_ARGS=""
 if [ -f "$PI_BENCH_DIR/.env" ]; then
@@ -109,6 +126,8 @@ for task_file in "${TASK_FILES[@]}"; do
     docker run --init -it --rm --network host $ENV_ARGS \
       -v "$PI_BENCH_DIR:/pi-bench:z" \
       -v "pi-bench-bun-cache:/root/.bun" \
+      -v "$HOME/.pi/agent:/root/.pi/agent:ro" \
+      $EXTENSIONS_MOUNT \
       "$IMAGE" \
       bash -c "
         set -e
