@@ -5,12 +5,12 @@ A lightweight, customizable benchmark runner for `pi-coding-agent`, inspired by 
 ## Overview
 `pi-bench` automates the process of testing an AI coding agent against real-world tasks. It does this by:
 1. Cloning a target repository to a temporary workspace (or using a pre-configured SWE-bench container).
-2. Checking out a specific baseline commit.
-3. Spinning up `pi-coding-agent` in the workspace with a predefined task prompt.
-4. Letting the agent use its tools (`read`, `bash`, `edit`, `write`) to complete the task.
-5. Capturing the generated patch (`git diff`).
+2. Checking out a specific baseline commit, then committing a clean `benchmark-baseline` snapshot so any pre-existing dirty files in the image (e.g. `setup.py`/`tox.ini`) aren't later attributed to the agent's diff.
+3. Spinning up `pi-coding-agent` in the workspace with a predefined task prompt. For containerized runs, this includes your real `~/.pi/agent` extensions, skills, prompts, and settings — see [pi-coding-agent Configuration](#pi-coding-agent-configuration-extensions-skills-settings) below.
+4. Letting the agent use its tools (`read`, `bash`, `edit`, `write`, plus whatever your extensions register) to complete the task.
+5. Capturing the generated patch (`git diff` against the baseline commit).
 6. **Running the test suite** — either from a `testCommand` (curated tasks) or SWE-bench `FAIL_TO_PASS` tests (inside the container).
-7. Using a secondary LLM **Judge** (Gemini) to evaluate the patch and provide a rationale for the score.
+7. **Scoring**: for SWE-bench container tasks, the `FAIL_TO_PASS` test result is the ground truth score — a secondary LLM **Judge** runs alongside it but only explains *why*, it can no longer flip a test-decided score. For tasks without a container test (curated `testCommand` tasks, or tasks with none), the judge decides the score directly.
 
 ## Setup
 
@@ -36,6 +36,15 @@ bun run src/index.ts tasks/example-task.json \
 ```
 A `[INFO] Score: 1` at the end means the agent, judge, and model auth are all working end-to-end.
 
+## pi-coding-agent Configuration (extensions, skills, settings)
+
+`bun run src/index.ts` (local execution) and the `run-docker.sh` / `run-swe-bench.sh` container runners all use `pi-coding-agent`'s standard config discovery, which defaults to `~/.pi/agent`. Concretely:
+
+- **`run-docker.sh` and `run-swe-bench.sh` mount your real `~/.pi/agent/{extensions,skills,prompts,agents,settings.json,AGENTS.md,npm}` into the container, read-only.** If `~/.pi/agent/extensions` is a symlink into a separate config repo (a common setup), the scripts detect that and mount the real target too, so the symlink resolves correctly inside the container. This means your custom tools, skills, prompt templates, and `settings.json` (including `defaultThinkingLevel`, `defaultModel`, etc.) apply the same way in a container as they do on your host.
+- **`auth.json`, `sessions/`, and `models-store.json` are deliberately *not* mounted.** Model/judge credentials for containerized runs come from `.env` → environment variables (see [API Keys](#api-keys) above), not from your host's stored credentials. This also avoids a real failure mode: `pi-ai`'s credential store creates a short-lived lock file on every auth read, even for a provider resolved via env var — mounting `auth.json` read-only breaks that with `EROFS`.
+- **npm-installed extension packages** (declared via `settings.json`'s `packages`, e.g. `npm:pi-lens`) are picked up from your host's `~/.pi/agent/npm` if already installed there — the containers don't have `npm` on `PATH`, so an extension that isn't already installed on your host can't be installed fresh inside the container.
+- To run without any of your personal config (a "clean" agent, closer to what a fresh SWE-bench evaluation container would have on its own), just don't mount `~/.pi/agent` — you'd need to fork the scripts or comment out the `RESOURCE_MOUNTS`/`EXTENSIONS_MOUNT` lines, there's no flag for this yet.
+
 ## Defining Tasks
 
 Benchmark tasks are defined as simple JSON files. See `tasks/curated/easy.json` for a reference:
@@ -50,7 +59,7 @@ Benchmark tasks are defined as simple JSON files. See `tasks/curated/easy.json` 
 }
 ```
 
-*Note: `solutionCommit`, `expectedDiff`, and `testCommand` are optional. If `testCommand` is provided, the runner will execute it in the workspace after the agent completes. A `0` exit code automatically grants a perfect score, bypassing the subjective LLM judge.*
+*Note: `solutionCommit`, `expectedDiff`, and `testCommand` are optional. If `testCommand` is provided, the runner will execute it in the workspace after the agent completes and pass the result to the judge as a strong signal — but for these non-SWE-bench tasks the **judge still decides the final score**, it isn't auto-passed on a `0` exit code. Ground-truth, test-decided scoring (see [How SWE-bench evaluation works](#how-swe-bench-evaluation-works)) is specific to SWE-bench container tasks with `FAIL_TO_PASS` tests.*
 
 ## Included Datasets
 
@@ -145,13 +154,16 @@ For cloud providers like OpenRouter, the provider endpoint is queried. Because t
 ```
 
 #### How SWE-bench evaluation works
+Before the agent starts, the runner commits a `benchmark-baseline` snapshot in `/testbed` (using an inline git identity, no global config needed), so any pre-existing dirty files in the container image are excluded from the agent's diff — only what the agent actually changed shows up.
+
 After the agent finishes editing code, the runner:
 1. **Applies the test patch** from the SWE-bench dataset (adds the regression tests)
 2. **Runs the `FAIL_TO_PASS` tests** inside the container using the correct Python and test runner
-3. **Score is ground truth** — if the tests pass, `score = 1`; if they fail, `score = 0`
-4. **The LLM Judge** (Gemini) receives both the diff and the test results, and provides a human-readable rationale explaining *why* the fix worked or didn't
+3. **Score is ground truth** — if the tests pass, `judgeScore = 1`; if they fail, `judgeScore = 0`. The judge can no longer override this.
+4. **The LLM Judge** receives both the diff and the test results and provides a human-readable rationale explaining *why* the fix worked or didn't. Its raw verdict is preserved separately as `judgeModelScore` (useful for measuring judge/test agreement over time), even when it's overridden by the test result. The judge call is retried up to 3 times on unparseable output before falling back to the test result.
+5. If the judge and agent are configured to the same model, the run logs a `[WARN] Judge model is the SAME as the agent model` notice — worth knowing, though it no longer affects the score for container tasks since the test decides it.
 
-This combines the objectivity of SWE-bench's test-based evaluation with the explainability of an LLM judge.
+This combines the objectivity of SWE-bench's test-based evaluation with the explainability of an LLM judge. Each result JSON also records `scoreSource` (`"container-test"` | `"judge"` | `"judge-parse-failed"`), `judgeParseFailed`, `judgeAttempts`, `judgeModel`, `timedOut`, and `loopRecoveries` (how many times the agent got stuck in a tool-call loop and had to be redirected) for later analysis.
 
 ### Curated Tasks (Docker sandbox)
 
@@ -281,7 +293,9 @@ Both `run-docker.sh` and `run-swe-bench.sh` automatically pass this file into th
 
 When a single run completes, it outputs a JSON artifact to the current directory (e.g. `results-curated-easy.json`).
 
-When running a **batch** (providing a directory like `tasks/verified-mini/`), `pi-bench` automatically generates a uniquely named directory for the results based on the model (e.g., `Qwen3_6-35B-A3B-UD-Q8_K_XL_gguf_results/`).
+When running a **batch** (providing a directory like `tasks/verified-mini/`), `pi-bench` automatically generates a uniquely named directory for the results based on the model (e.g., `Qwen3_6-35B-A3B-UD-Q8_K_XL_gguf_results/`). Re-running the same command later skips any task whose `results-<id>.json` already exists — use `--model-tag` to force a fresh, separately-tracked run instead of skipping.
+
+Each `results-<id>.json` records, alongside the standard `diff`/`testOutput` fields: `judgeScore` (final), `judgeModelScore` (raw judge verdict, preserved even when overridden), `scoreSource`, `judgeParseFailed`, `judgeAttempts`, `judgeModel`, `timedOut`, and `loopRecoveries` — see [How SWE-bench evaluation works](#how-swe-bench-evaluation-works). `run-meta.json` for a batch also records `agentModel`, `judgeModel`, `timeoutMin`, and `excludeTools`. Note that `summary.json` (the per-run aggregate) is generated separately by `run-swe-bench.sh`'s own aggregation step and by `bun run scripts/generate-report.ts` for the dashboard — the dashboard reads the individual `results-*.json` files directly, not `summary.json`.
 
 ### Populating the Dashboard
 `pi-bench` includes a dynamic HTML dashboard that can track results across multiple hardware platforms. To get your results onto the dashboard:

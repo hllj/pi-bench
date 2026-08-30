@@ -12,8 +12,14 @@ set -e
 #   1. Iterates over task files in the given directory (or runs a single task file)
 #   2. For each task, launches the corresponding SWE-bench container
 #   3. Installs bun + pi-bench deps inside the container (cached via Docker volume)
-#   4. Runs the benchmark: agent works in /testbed, then FAIL_TO_PASS tests are executed
-#   5. Results are written back to the host via the bind-mounted pi-bench directory
+#   4. Mounts your ~/.pi/agent extensions/skills/prompts/settings.json read-only
+#      (see the RESOURCE_MOUNTS block below) -- auth.json/sessions/models-store.json
+#      are NOT mounted, so model/judge credentials still come from .env
+#   5. Commits a benchmark-baseline in /testbed before the agent runs, so the
+#      agent's diff excludes pre-existing image noise (setup.py/tox.ini/etc.)
+#   6. Runs the benchmark: agent works in /testbed, then FAIL_TO_PASS tests decide
+#      the score (ground truth) -- the LLM judge only explains why
+#   7. Results are written back to the host via the bind-mounted pi-bench directory
 
 TARGET="${1:?Usage: ./run-swe-bench.sh <task-file-or-dir> [extra-args...]}"
 shift
