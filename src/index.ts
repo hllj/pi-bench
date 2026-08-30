@@ -516,31 +516,42 @@ ${testResultsSection}
 `;
 
     let judgeOutput = "";
-    const stream = modelRuntime.streamSimple(judgeModel, {
-      systemPrompt: judgeSystemPrompt,
-      messages: [{ role: "user", content: judgePrompt, timestamp: Date.now() }]
-    }, { apiKey: auth.apiKey, headers: auth.headers });
-
-    for await (const chunk of stream) {
-      if (chunk.type === "text_delta") {
-        judgeOutput += chunk.delta;
-      }
-      if (chunk.type === "error") {
-        console.error("[DEBUG] streamSimple error:", chunk.error);
-      }
-    }
-    console.log("[DEBUG] Raw judge output:", judgeOutput);
-
     let score = 0;
     let rationale = "Failed to parse judge output";
-    try {
-      const jsonStr = judgeOutput.match(/\{[\s\S]*\}/)?.[0] || judgeOutput;
-      const parsed = JSON.parse(jsonStr);
-      score = parsed.score;
-      rationale = parsed.rationale;
-    } catch (e) {
-      console.error("[ERROR] Failed to parse judge JSON", e);
-      rationale = judgeOutput;
+    const maxJudgeAttempts = 3;
+    for (let attempt = 1; attempt <= maxJudgeAttempts; attempt++) {
+      judgeOutput = "";
+      const stream = modelRuntime.streamSimple(judgeModel, {
+        systemPrompt: judgeSystemPrompt,
+        messages: [{ role: "user", content: judgePrompt, timestamp: Date.now() }]
+      }, { apiKey: auth.apiKey, headers: auth.headers });
+
+      for await (const chunk of stream) {
+        if (chunk.type === "text_delta") {
+          judgeOutput += chunk.delta;
+        }
+        if (chunk.type === "error") {
+          console.error("[DEBUG] streamSimple error:", chunk.error);
+        }
+      }
+      console.log(`[DEBUG] Raw judge output (attempt ${attempt}/${maxJudgeAttempts}):`, judgeOutput);
+
+      try {
+        const jsonStr = judgeOutput.match(/\{[\s\S]*\}/)?.[0] || judgeOutput;
+        const parsed = JSON.parse(jsonStr);
+        if (typeof parsed.score !== "number" || typeof parsed.rationale !== "string") {
+          throw new Error("Judge JSON missing required 'score'/'rationale' fields");
+        }
+        score = parsed.score;
+        rationale = parsed.rationale;
+        break;
+      } catch (e) {
+        console.error(`[ERROR] Failed to parse judge JSON (attempt ${attempt}/${maxJudgeAttempts})`, e);
+        rationale = judgeOutput || "Failed to parse judge output";
+        if (attempt < maxJudgeAttempts) {
+          console.log(`[INFO] Retrying LLM judge...`);
+        }
+      }
     }
 
     // The judge now provides the final score, taking test results into account but allowed to override them.
@@ -620,8 +631,11 @@ async function main() {
   } else {
     excludeTools = DEFAULT_EXCLUDED_TOOLS;
   }
-  if (excludeTools.length > 0) {
-    console.log(`[INFO] Excluding tools: ${excludeTools.join(", ")}`);
+  // console.error, not console.log: --print-output-dir's only stdout contract
+  // is the directory path (run-swe-bench.sh captures it via `$(...)`), and
+  // this line runs before that check on every invocation.
+  if (excludeTools.length > 0 && !values["print-output-dir"]) {
+    console.error(`[INFO] Excluding tools: ${excludeTools.join(", ")}`);
   }
 
   // --provider takes precedence, --engine is a backward-compat alias
