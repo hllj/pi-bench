@@ -47,6 +47,55 @@ function buildSweTestCommand(task: any): string {
   return `cd /testbed && ${python} -m pytest --tb=short`;
 }
 
+// Restores the repo's standard test directories to HEAD and drops any
+// untracked files the agent added there. Used before EVERY acceptance-test
+// run so (a) the official SWE-bench test patch applies cleanly and (b) the
+// agent can never force a pass by editing the tests it is scored against.
+// IMPORTANT: Each directory MUST be reverted in its own command.
+// Passing multiple paths (e.g. `git checkout -- tests/ test/ testing/`)
+// causes git to abort the ENTIRE operation if ANY pathspec doesn't match,
+// silently leaving all test files un-reverted.
+async function revertAgentTestModifications(tmpDir: string): Promise<void> {
+  console.log(`[INFO] Reverting agent test modifications to avoid conflicts...`);
+  for (const testDir of ['tests/', 'test/', 'testing/']) {
+    try {
+      // Single atomic operation: restores both index and working tree to HEAD
+      await execAsync(`git checkout HEAD -- ${testDir}`, { cwd: tmpDir });
+      console.log(`[INFO] Reverted ${testDir} to HEAD.`);
+    } catch {
+      // Directory doesn't exist in this repo — expected, not an error
+    }
+  }
+  // Clean any untracked files the agent may have added in test directories
+  await execAsync(`git clean -fd tests/ test/ testing/ 2>/dev/null || true`, { cwd: tmpDir });
+}
+
+// Writes and applies the official SWE-bench test patch. The patch file is
+// always removed afterwards (even on failure) so that a later `git add .`
+// (see getDiff) can never stage the official test patch into the agent's
+// stored diff.
+async function applySweTestPatch(tmpDir: string, testPatch: string): Promise<void> {
+  const patchPath = join(tmpDir, "swe_test.patch");
+  await writeFile(patchPath, testPatch);
+  try {
+    try {
+      await execAsync(`git apply swe_test.patch`, { cwd: tmpDir });
+    } catch {
+      console.log(`[INFO] Standard git apply failed, trying 3-way merge...`);
+      await execAsync(`git apply --3way swe_test.patch`, { cwd: tmpDir });
+    }
+    console.log(`[INFO] Test patch applied successfully.`);
+  } finally {
+    await rm(patchPath, { force: true });
+  }
+}
+
+// Full "make the acceptance tests pristine again, then install them" sequence.
+async function revertAndApplySweTestPatch(tmpDir: string, testPatch: string): Promise<void> {
+  await revertAgentTestModifications(tmpDir);
+  await applySweTestPatch(tmpDir, testPatch);
+}
+
 async function runSweBenchTestCommand(tmpDir: string, task: any): Promise<{ testExitCode: number; testOutput: string }> {
   const sweTestCmd = buildSweTestCommand(task);
   console.log(`[INFO] SWE test command: ${sweTestCmd}`);
@@ -255,6 +304,25 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
             console.error(`\n[ERROR] Agent execution timed out after ${timeoutMin} minutes. Aborting...`);
             await session.abort();
             timedOut = true;
+          } else if (archaeologyNudgeNeeded || err.message === "ARCHAEOLOGY_NUDGE") {
+            // MUST be checked BEFORE the loop-detection branch: the archaeology
+            // detector also calls session.abort(), and the loop branch's generic
+            // `AbortError` / "abort" clauses would otherwise swallow an
+            // archaeology abort (corrupting loopRecoveries, sending the wrong
+            // steer message, and leaving archaeologyNudgeNeeded set so the next
+            // prompt throws immediately). This branch has no catch-all clauses,
+            // so a genuine loop abort (loopDetected === true, set synchronously
+            // before the abort) still falls through to the loop branch below.
+            archaeologyNudgeNeeded = false;
+            archaeologyState.count = 0;
+            if (archaeologyNudgesUsed >= maxArchaeologyNudges) {
+              console.log(`\n[INFO] Archaeology nudge budget exhausted (${archaeologyNudgesUsed}/${maxArchaeologyNudges}) — letting normal flow continue.`);
+              break;
+            }
+            archaeologyNudgesUsed++;
+            console.log(`\n[INFO] Recovering from git-archaeology streak (${archaeologyNudgesUsed}/${maxArchaeologyNudges})... Prompting agent to stop investigating history.`);
+            currentPrompt = `SYSTEM WARNING: You have spent several tool calls exploring git history (log/show/blame) without editing any file. Per your instructions, git archaeology should only be used if essential - stop investigating history now and make the code change based on what you already know. If you are genuinely blocked, make your best-effort fix now rather than continuing to investigate.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
+            maxLoops--;
           } else if (loopDetected || err.message === "LOOP_DETECTED" || err.name === "AbortError" || err.message?.includes("abort")) {
             console.log(`\n[INFO] Recovering from tool loop... Prompting agent to try something else.`);
             loopRecoveries++;
@@ -263,14 +331,6 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
             repeatedToolCount = 0;
             lastToolName = "";
             lastToolArgs = "";
-            maxLoops--;
-          } else if (archaeologyNudgeNeeded || err.message === "ARCHAEOLOGY_NUDGE") {
-            archaeologyNudgesUsed++;
-            console.log(`\n[INFO] Recovering from git-archaeology streak (${archaeologyNudgesUsed}/${maxArchaeologyNudges})... Prompting agent to stop investigating history.`);
-            currentPrompt = `SYSTEM WARNING: You have spent several tool calls exploring git history (log/show/blame) without editing any file. Per your instructions, git archaeology should only be used if essential - stop investigating history now and make the code change based on what you already know. If you are genuinely blocked, make your best-effort fix now rather than continuing to investigate.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
-            archaeologyNudgeNeeded = false;
-            archaeologyState.count = 0;
-            if (archaeologyNudgesUsed >= maxArchaeologyNudges) maxLoops = 0; // stop nudging after 2, let the timeout/normal flow take over
             maxLoops--;
           } else {
             throw err;
@@ -412,35 +472,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       if (task.testPatch) {
         console.log(`[INFO] Applying SWE-bench test patch...`);
         try {
-          const patchPath = join(tmpDir, "swe_test.patch");
-          await writeFile(patchPath, task.testPatch);
-
-          // Revert any changes the agent made to standard test directories
-          // to prevent patch conflicts with the SWE-bench evaluation testPatch.
-          // IMPORTANT: Each directory MUST be reverted in its own command.
-          // Passing multiple paths (e.g. `git checkout -- tests/ test/ testing/`)
-          // causes git to abort the ENTIRE operation if ANY pathspec doesn't match,
-          // silently leaving all test files un-reverted.
-          console.log(`[INFO] Reverting agent test modifications to avoid conflicts...`);
-          for (const testDir of ['tests/', 'test/', 'testing/']) {
-            try {
-              // Single atomic operation: restores both index and working tree to HEAD
-              await execAsync(`git checkout HEAD -- ${testDir}`, { cwd: tmpDir });
-              console.log(`[INFO] Reverted ${testDir} to HEAD.`);
-            } catch {
-              // Directory doesn't exist in this repo — expected, not an error
-            }
-          }
-          // Clean any untracked files the agent may have added in test directories
-          await execAsync(`git clean -fd tests/ test/ testing/ 2>/dev/null || true`, { cwd: tmpDir });
-
-          try {
-            await execAsync(`git apply swe_test.patch`, { cwd: tmpDir });
-          } catch {
-            console.log(`[INFO] Standard git apply failed, trying 3-way merge...`);
-            await execAsync(`git apply --3way swe_test.patch`, { cwd: tmpDir });
-          }
-          console.log(`[INFO] Test patch applied successfully.`);
+          await revertAndApplySweTestPatch(tmpDir, task.testPatch);
         } catch (e) {
           console.warn(`[WARN] Failed to apply test patch:`, e);
         }
@@ -456,6 +488,11 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       if (testExitCode !== 0 && !timedOut && (!lastAssistant || lastAssistant.stopReason !== "error")) {
         console.log(`\n[INFO] Fix failed the real acceptance tests. Giving the agent one corrective pass with the actual failure output...`);
         const retryPrompt = buildVerificationRetryPrompt(testOutput, task);
+        // Fresh phase: a git-archaeology streak left over from the main prompt
+        // phase must not abort this focused corrective turn on its very first
+        // history call. (archaeologyNudgesUsed is deliberately NOT reset — it
+        // is an intentional whole-task budget, not a per-phase one.)
+        archaeologyState.count = 0;
         try {
           await runPromptWithLoopDetection(retryPrompt);
         } catch (err: any) {
@@ -473,8 +510,32 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
 
         verificationRetries = 1;
 
+        // The retry turn had full bash/edit/write access AND was handed the
+        // exact failing test names, so restore the acceptance tests to HEAD
+        // BEFORE the diff is captured: (a) the agent must not be able to force
+        // a pass by editing the tests (testExitCode is the sole scoring
+        // authority), and (b) the stored diff must reflect only the agent's
+        // real change. Diff-then-apply mirrors the initial run's ordering
+        // (diff captured with no test patch applied).
+        if (task.testPatch) {
+          try {
+            await revertAgentTestModifications(tmpDir);
+          } catch (e) {
+            console.warn(`[WARN] Failed to revert agent test modifications:`, e);
+          }
+        }
+
         console.log(`[INFO] Re-extracting diff after verification retry...`);
         diff = await getDiff();
+
+        if (task.testPatch) {
+          console.log(`[INFO] Re-applying SWE-bench test patch before re-running tests...`);
+          try {
+            await applySweTestPatch(tmpDir, task.testPatch);
+          } catch (e) {
+            console.warn(`[WARN] Failed to apply test patch:`, e);
+          }
+        }
 
         console.log(`[INFO] Re-running SWE-bench FAIL_TO_PASS tests after retry...`);
         ({ testExitCode, testOutput } = await runSweBenchTestCommand(tmpDir, task));
@@ -660,6 +721,7 @@ ${testResultsSection}
       timedOut,
       loopRecoveries,
       verificationRetries,
+      archaeologyNudges: archaeologyNudgesUsed,
     };
     if (isSweContainer) {
       result.sweContainerTest = true;
