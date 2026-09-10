@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
 import { parseJudgeOutput } from "./judge";
+import { buildAgentPrompt } from "./prompts";
 
 const execAsync = promisify(exec);
 
@@ -200,22 +201,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
 
     console.log(`\n--- Agent output ---`);
     const start = Date.now();
-    const sweEnvInstruction = isSweContainer
-      ? `7. The development environment is already fully configured with the correct Python version and all dependencies pre-installed. Do NOT install packages, create virtual environments, or modify the Python installation. Just focus on understanding and fixing the bug.\n8. If necessary you can write tests or modify existing tests to verify your fix. Avoid running the entire test suite though, if you can only focus on tests that are relevant to the code you're changing to ensure you're not introducing regressions.\n9. Make the MINIMAL changes necessary to fix the issue. Do not refactor unrelated code.\n10. TIME EFFICIENCY - Do NOT waste time on:\n    - Unnecessary git archaeology (git log, git show). Focus on the CURRENT code, not its history, unless you deem it essential to fix the issue.\n    - Re-running the same test with different pipe/grep/tail flags. Capture the full output ONCE and read it.\n    - Guessing test class/function names. If unsure, grep for the class name first BEFORE running.\n11. INFINITE LOOP PREVENTION - When running test suites or scripts that execute code you have modified, wrap the command with \`timeout\` to guard against inadvertent infinite loops (e.g., \`timeout 300 python -m pytest tests/test_xxx.py -xvs\`). No single test run should need more than 5 minutes.`
-      : "";
-    const agentPrompt = `You are an expert AI coding assistant. The target repository has ALREADY been cloned into your CURRENT WORKING DIRECTORY (\`${tmpDir}\`). 
-
-CRITICAL INSTRUCTIONS:
-1. Do NOT use \`git clone\` or download any repositories. The code is already here.
-2. ALL your work (fixes and tests) must be done STRICTLY within your current working directory. Use relative paths (e.g., \`.\`) instead of absolute paths.
-3. Do NOT explore, read, or modify files outside of your current working directory.
-4. Focus only on fixing the issue described below and verifying your fix with tests.
-5. You are running completely autonomously. There is NO human interaction. You must independently investigate, write the fix, verify it, and then STOP calling tools when you are done.
-6. You are to complete the task and produce changes editing the files in this project. Do not stop without editing the files required to complete the task!
-${sweEnvInstruction}
-
-Issue Description:
-${task.prompt}`;
+    const agentPrompt = buildAgentPrompt({ tmpDir, isSweContainer, taskPrompt: task.prompt });
     const timeoutMs = timeoutMin * 60 * 1000;
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error("AGENT_TIMEOUT")), timeoutMs);
