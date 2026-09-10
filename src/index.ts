@@ -13,6 +13,7 @@ import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
 import { parseJudgeOutput } from "./judge";
 import { buildAgentPrompt } from "./prompts";
+import { trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
 
 const execAsync = promisify(exec);
 
@@ -156,6 +157,11 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     let loopDetected = false;
     let loopRecoveries = 0;
 
+    let archaeologyState: ArchaeologyState = { count: 0 };
+    let archaeologyNudgeNeeded = false;
+    let archaeologyNudgesUsed = 0;
+    const maxArchaeologyNudges = 2;
+
     session.subscribe((event) => {
       if (event.type === "message_update" && event.assistantMessageEvent) {
         if (event.assistantMessageEvent.type === "text_delta") {
@@ -179,6 +185,12 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
           if (repeatedToolCount >= 3) {
             console.warn(`\n[WARN] Loop detected! Tool ${event.toolName} called ${repeatedToolCount} times with same arguments.`);
             loopDetected = true;
+            session.abort();
+          }
+
+          if (!loopDetected && !archaeologyNudgeNeeded && trackGitArchaeology(archaeologyState, event.toolName, argsStr)) {
+            console.warn(`\n[WARN] Git-archaeology streak detected (${archaeologyState.count} history calls, no edits). Nudging agent to make a change.`);
+            archaeologyNudgeNeeded = true;
             session.abort();
           }
 
@@ -220,6 +232,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
             timeoutPromise
           ]);
           if (loopDetected) throw new Error("LOOP_DETECTED");
+          if (archaeologyNudgeNeeded) throw new Error("ARCHAEOLOGY_NUDGE");
           break; // Finished successfully
         } catch (err: any) {
           if (err.message === "AGENT_TIMEOUT") {
@@ -234,6 +247,14 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
             repeatedToolCount = 0;
             lastToolName = "";
             lastToolArgs = "";
+            maxLoops--;
+          } else if (archaeologyNudgeNeeded || err.message === "ARCHAEOLOGY_NUDGE") {
+            archaeologyNudgesUsed++;
+            console.log(`\n[INFO] Recovering from git-archaeology streak (${archaeologyNudgesUsed}/${maxArchaeologyNudges})... Prompting agent to stop investigating history.`);
+            currentPrompt = `SYSTEM WARNING: You have spent several tool calls exploring git history (log/show/blame) without editing any file. Per your instructions, git archaeology should only be used if essential - stop investigating history now and make the code change based on what you already know. If you are genuinely blocked, make your best-effort fix now rather than continuing to investigate.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
+            archaeologyNudgeNeeded = false;
+            archaeologyState.count = 0;
+            if (archaeologyNudgesUsed >= maxArchaeologyNudges) maxLoops = 0; // stop nudging after 2, let the timeout/normal flow take over
             maxLoops--;
           } else {
             throw err;
