@@ -461,6 +461,16 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         } catch (err: any) {
           if (err.message !== "AGENT_TIMEOUT") throw err;
         }
+
+        lastAssistant = [...session.messages].reverse().find(m => m.role === "assistant") as any;
+        if (lastAssistant && lastAssistant.stopReason === "error") {
+          const errorMsg = lastAssistant.errorMessage || "Unknown error";
+          const isConnectionError = /connection|fetch failed|socket|refused|lost|connect|timeout|timed out|500|502|503|504/i.test(errorMsg);
+          if (isConnectionError) {
+            throw new Error(`Inference backend is unreachable or crashed: ${errorMsg}`);
+          }
+        }
+
         verificationRetries = 1;
 
         console.log(`[INFO] Re-extracting diff after verification retry...`);

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildAgentPrompt, buildSweEnvInstruction } from "./prompts";
-import { buildVerificationRetryPrompt } from "./prompts";
+import { buildAgentPrompt, buildSweEnvInstruction, buildVerificationRetryPrompt } from "./prompts";
 
 describe("buildSweEnvInstruction", () => {
   test("returns empty string when not running in an SWE container", () => {
