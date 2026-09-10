@@ -29,7 +29,9 @@ htmlcov/
 # Project specific
 swe-bench-verified-mini.json
 swe-bench-*.json
+models-store.json
 
 # OS files
 .DS_Store
 Thumbs.db
+benchmark_results/

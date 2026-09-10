@@ -1,10 +1,9 @@
 import {
-  AuthStorage,
   createAgentSession,
   ModelRegistry,
+  ModelRuntime,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
-import { getModel } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-coding-agent";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -45,7 +44,59 @@ function buildSweTestCommand(task: any): string {
   return `cd /testbed && ${python} -m pytest --tb=short`;
 }
 
-async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number) {
+// Robustly parse the LLM judge's JSON verdict. Returns parseFailed=true with a
+// readable message when the output is unparseable or degenerate, so callers can
+// fall back to ground truth (container test) instead of a silent default of 0.
+function parseJudgeOutput(raw: string): { score: number | null; rationale: string; parseFailed: boolean } {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) {
+    return { score: null, rationale: "Judge returned empty output", parseFailed: true };
+  }
+  // Strip markdown code fences (```, ```json) before parsing
+  const stripped = trimmed.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
+
+  // Degenerate guard: nonsensical repeated-token output (e.g. "the the the ...")
+  const words = stripped.split(/\s+/).filter(Boolean);
+  if (words.length >= 20) {
+    const uniq = new Set(words.map((w) => w.toLowerCase()));
+    if (uniq.size <= 2) {
+      return {
+        score: null,
+        rationale: `Judge output degenerate (repeated token ${words.length}x) — treated as parse failure`,
+        parseFailed: true,
+      };
+    }
+  }
+
+  // Attempt 1: parse the full JSON object (first '{' to last '}')
+  const jsonBlock = stripped.match(/\{[\s\S]*\}/);
+  if (jsonBlock) {
+    try {
+      const parsed = JSON.parse(jsonBlock[0]);
+      if (typeof parsed.score === "number" && typeof parsed.rationale === "string") {
+        const s = parsed.score === 1 || parsed.score === 0 ? parsed.score : (parsed.score > 0.5 ? 1 : 0);
+        return { score: s, rationale: parsed.rationale, parseFailed: false };
+      }
+    } catch (e) { /* fall through to fallback regex */ }
+  }
+
+  // Attempt 2: salvage a score via regex, and the rationale if quoted
+  const candidate = jsonBlock ? jsonBlock[0] : stripped;
+  const scoreMatch = candidate.match(/"score"\s*[:：]\s*([012])\b/);
+  if (scoreMatch) {
+    // Same coercion as the full-JSON-parse path above, so out-of-range scores
+    // (e.g. 2 from an overconfident judge) resolve identically on both paths.
+    const num = parseInt(scoreMatch[1], 10);
+    const s = num === 1 || num === 0 ? num : (num > 0.5 ? 1 : 0);
+    const ratMatch = candidate.match(/"rationale"\s*[:：]\s*"([\s\S]*?)"\s*[,}\]]/);
+    const rationale = ratMatch ? ratMatch[1] : "Judge rationale not extracted";
+    return { score: s, rationale, parseFailed: false };
+  }
+
+  return { score: null, rationale: trimmed.slice(0, 400) || "Failed to parse judge output", parseFailed: true };
+}
+
+async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[]) {
   const taskContent = await readFile(taskFile, "utf-8");
   const task = JSON.parse(taskContent);
 
@@ -61,10 +112,16 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
   try {
     if (isSweContainer) {
       console.log(`[INFO] Using pre-configured SWE-bench testbed at ${sweTestbed}`);
-      // Ensure git is initialized in /testbed for diff extraction
+      // Ensure git is initialized, then commit a clean baseline so pre-existing
+      // image noise (e.g. setup.py/tox.ini/CHANGES shipped dirty) is NOT
+      // attributed to the agent's diff. The agent's changes are then diffed
+      // against this baseline exactly.
       try { await execAsync(`git status`, { cwd: tmpDir }); } catch {
-        await execAsync(`git init && git add -A && git commit -m "baseline" --allow-empty`, { cwd: tmpDir });
+        await execAsync(`git init`, { cwd: tmpDir });
       }
+      await execAsync(`git add -A`, { cwd: tmpDir });
+      await execAsync(`git -c user.email=bench@pi.local -c user.name="Pi Benchmarker" commit -m "benchmark-baseline" --allow-empty`, { cwd: tmpDir });
+      console.log(`[INFO] Baseline commit created (pre-existing image changes excluded from agent diff).`);
     } else {
       console.log(`[INFO] Cloning ${task.repo} at commit ${task.commit}...`);
       await execAsync(`git init`, { cwd: tmpDir });
@@ -75,10 +132,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     }
 
     console.log(`[INFO] Initializing agent session...`);
-    const authStorage = AuthStorage.create();
 
     const localModelsPath = join(process.cwd(), "models.json");
-    let modelRegistry;
+    let modelsPath: string | undefined;
     if (existsSync(localModelsPath)) {
       console.log(`[INFO] Using local models.json configuration`);
       if (port) {
@@ -89,9 +145,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         }
         const tmpModelsPath = tmpDir + "-models.json";
         await writeFile(tmpModelsPath, JSON.stringify(modelsData));
-        modelRegistry = ModelRegistry.create(authStorage, tmpModelsPath);
+        modelsPath = tmpModelsPath;
       } else {
-        modelRegistry = ModelRegistry.create(authStorage, localModelsPath);
+        modelsPath = localModelsPath;
       }
     } else {
       if (port) {
@@ -107,11 +163,12 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         };
         const tmpModelsPath = tmpDir + "-models.json";
         await writeFile(tmpModelsPath, JSON.stringify(modelsData));
-        modelRegistry = ModelRegistry.create(authStorage, tmpModelsPath);
-      } else {
-        modelRegistry = ModelRegistry.create(authStorage);
+        modelsPath = tmpModelsPath;
       }
     }
+
+    const modelRuntime = await ModelRuntime.create(modelsPath ? { modelsPath } : undefined);
+    const modelRegistry = new ModelRegistry(modelRuntime);
 
     let resolvedAgentModel;
     if (agentModelReq) {
@@ -120,7 +177,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         throw new Error(`Could not find model ${agentModelReq.provider}/${agentModelReq.id} in registry`);
       }
     } else {
-      const providerModels = modelRegistry.getAll().filter(m => m.provider === provider);
+      const providerModels = modelRegistry.getAll().filter((m: any) => m.provider === provider);
       if (providerModels.length > 0) {
         resolvedAgentModel = providerModels[0];
         console.log(`[INFO] No agent model specified, defaulting to ${resolvedAgentModel.provider}/${resolvedAgentModel.id}`);
@@ -136,9 +193,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     const { session } = await createAgentSession({
       cwd: tmpDir,
       sessionManager: SessionManager.inMemory(tmpDir),
-      authStorage,
-      modelRegistry,
+      modelRuntime,
       model: resolvedAgentModel,
+      excludeTools: excludeTools && excludeTools.length > 0 ? excludeTools : undefined,
     });
 
     console.log(`[INFO] Agent resolved to model: ${session.model?.provider}/${session.model?.id}`);
@@ -147,6 +204,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     let lastToolArgs = "";
     let repeatedToolCount = 0;
     let loopDetected = false;
+    let loopRecoveries = 0;
 
     session.subscribe((event) => {
       if (event.type === "message_update" && event.assistantMessageEvent) {
@@ -235,6 +293,7 @@ ${task.prompt}`;
             timedOut = true;
           } else if (loopDetected || err.message === "LOOP_DETECTED" || err.name === "AbortError" || err.message?.includes("abort")) {
             console.log(`\n[INFO] Recovering from tool loop... Prompting agent to try something else.`);
+            loopRecoveries++;
             currentPrompt = `SYSTEM WARNING: You are repeatedly calling the tool \`${lastToolName}\` with the exact same arguments: \`${lastToolArgs}\`. This is an infinite loop. The last execution was aborted. You MUST try a completely different approach, use different arguments, or implement the fix now.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
             loopDetected = false;
             repeatedToolCount = 0;
@@ -456,8 +515,33 @@ ${task.prompt}`;
     }
 
     console.log(`[INFO] Running LLM judge...`);
-    const judgeModel = judgeModelReq || session.state.model;
+    // The resolved agent model (what the agent session actually uses) is the
+    // judge default here; keep a reference to detect self-grading correctly.
+    const defaultJudgeModel = session.state.model as any;
+    let judgeModel = defaultJudgeModel;
+    if (judgeModelReq) {
+      const resolvedJudgeModel = modelRegistry.find(judgeModelReq.provider, judgeModelReq.id);
+      if (resolvedJudgeModel) {
+        judgeModel = resolvedJudgeModel;
+      } else {
+        console.warn(`[WARN] Could not resolve judge model ${judgeModelReq.provider}/${judgeModelReq.id}. Using default.`);
+      }
+    }
     if (!judgeModel) throw new Error("Judge model not found");
+    // Self-grading check: compare against the RESOLVED agent model, on BOTH
+    // provider and id. Same id on a different provider (e.g. local ds4 vs
+    // openrouter both exposing "deepseek-v4-flash") is NOT self-grading, and
+    // comparing the raw CLI request would silently miss local-provider runs.
+    if (
+      defaultJudgeModel &&
+      judgeModel.provider === defaultJudgeModel.provider &&
+      judgeModel.id === defaultJudgeModel.id
+    ) {
+      console.warn(`\n[WARN] Judge model is the SAME as the agent model (${judgeModel.provider}/${judgeModel.id}) — the model is grading its own output.
+For SWE-bench tasks the container test now decides the score, so this only affects the rationale.
+Pass --judge-model (e.g. openrouter/deepseek/deepseek-v4-pro) for an independent judge.\n`);
+    }
+    console.log(`[INFO] Judge model: ${judgeModel.provider}/${judgeModel.id}`);
     const auth = await modelRegistry.getApiKeyAndHeaders(judgeModel);
     if (!auth.ok) throw new Error("Judge auth failed: " + auth.error);
 
@@ -473,13 +557,15 @@ ${task.prompt}`;
       }
     }
 
-    const judgeSystemPrompt = `You are an expert software engineer judging the output of an AI coding agent.
+    const judgeSystemPrompt = `You are an expert software engineer reviewing the output of an AI coding agent.
 You will be provided with the task prompt, the expected behavior, the git diff generated by the agent, and optionally a known correct "solution diff" and automated test output.
-Your job is to determine if the diff successfully accomplishes the task. If automated tests were run, consider them a strong signal, but NOT the absolute ground truth. 
-If a test fails (e.g., due to strict framework type assertions like expecting an integer instead of a string), but you determine the agent's code practically solves the user's issue in a valid way, you MAY still score it a 1. Provide a detailed rationale explaining why you bypassed the test failure.
+Your job is to determine if the diff successfully accomplishes the task and explain why (or why not).
+- If automated tests were run and PASSED, the patch is accepted: score 1 with a concise explanation.
+- If automated tests were run and FAILED, the patch did NOT satisfy the acceptance tests: score 0 unless you have a compelling reason the failure is unrelated to the change (e.g. a pre-existing/environment failure), which you must explain in the rationale.
+- If no automated tests were run, judge the diff on its own merits against the expected behavior and the known correct solution.
 Respond ONLY with a JSON object in this exact format, with no markdown wrapping:
 {
-  "score": 1,
+  "score": 0 or 1,
   "rationale": "Explanation for the score"
 }`;
 
@@ -509,36 +595,63 @@ ${testResultsSection}
 `;
 
     let judgeOutput = "";
-    const { streamSimple } = await import("@mariozechner/pi-ai");
-    const stream = streamSimple(judgeModel, {
-      systemPrompt: judgeSystemPrompt,
-      messages: [{ role: "user", content: judgePrompt, timestamp: Date.now() }]
-    }, { apiKey: auth.apiKey, headers: auth.headers });
-
-    for await (const chunk of stream) {
-      if (chunk.type === "text_delta") {
-        judgeOutput += chunk.delta;
-      }
-      if (chunk.type === "error") {
-        console.error("[DEBUG] streamSimple error:", chunk.error);
-      }
-    }
-    console.log("[DEBUG] Raw judge output:", judgeOutput);
-
-    let score = 0;
+    let judgeScore: number | null = null;
     let rationale = "Failed to parse judge output";
-    try {
-      const jsonStr = judgeOutput.match(/\{[\s\S]*\}/)?.[0] || judgeOutput;
-      const parsed = JSON.parse(jsonStr);
-      score = parsed.score;
+    let judgeParseFailed = true;
+    let judgeAttemptsUsed = 0;
+    const maxJudgeAttempts = 3;
+    for (let attempt = 1; attempt <= maxJudgeAttempts; attempt++) {
+      judgeAttemptsUsed = attempt;
+      judgeOutput = "";
+      const stream = modelRuntime.streamSimple(judgeModel, {
+        systemPrompt: judgeSystemPrompt,
+        messages: [{ role: "user", content: judgePrompt, timestamp: Date.now() }]
+      }, { apiKey: auth.apiKey, headers: auth.headers });
+
+      for await (const chunk of stream) {
+        if (chunk.type === "text_delta") {
+          judgeOutput += chunk.delta;
+        }
+        if (chunk.type === "error") {
+          console.error("[DEBUG] streamSimple error:", chunk.error);
+        }
+      }
+      const preview = judgeOutput.length > 500 ? judgeOutput.slice(0, 500) + "... [TRUNCATED]" : judgeOutput;
+      console.log(`[DEBUG] Raw judge output (attempt ${attempt}/${maxJudgeAttempts}):`, preview);
+
+      const parsed = parseJudgeOutput(judgeOutput);
+      if (!parsed.parseFailed) {
+        judgeScore = parsed.score;
+        rationale = parsed.rationale;
+        judgeParseFailed = false;
+        break;
+      }
+      console.error(`[ERROR] Failed to parse judge output (attempt ${attempt}/${maxJudgeAttempts}): ${parsed.rationale.slice(0, 300)}`);
       rationale = parsed.rationale;
-    } catch (e) {
-      console.error("[ERROR] Failed to parse judge JSON", e);
-      rationale = judgeOutput;
+      if (attempt < maxJudgeAttempts) {
+        console.log(`[INFO] Retrying LLM judge...`);
+      }
     }
 
-    // The judge now provides the final score, taking test results into account but allowed to override them.
-    const finalScore = score;
+    // #1 Ground-truth-first scoring: for SWE-bench container tasks the
+    // FAIL_TO_PASS test result DECIDES the score; the LLM judge only explains
+    // (its raw verdict is recorded as judgeModelScore for later comparison).
+    // For other tasks the judge decides; unparseable judge output defaults to 0.
+    let scoreSource: "container-test" | "judge" | "judge-parse-failed" = "judge";
+    let finalScore: number = 0;
+    if (isSweContainer && task.failToPass && task.failToPass.length > 0 && testExitCode !== null) {
+      scoreSource = "container-test";
+      finalScore = testExitCode === 0 ? 1 : 0;
+      if (judgeScore !== null && judgeScore !== finalScore) {
+        console.log(`[INFO] Judge raw score ${judgeScore} but container test ${testExitCode === 0 ? "PASSED" : "FAILED"} (exit ${testExitCode}) — final score decided by the test.`);
+      }
+    } else if (judgeScore !== null && !judgeParseFailed) {
+      scoreSource = "judge";
+      finalScore = judgeScore === 1 ? 1 : 0;
+    } else {
+      scoreSource = "judge-parse-failed";
+      finalScore = 0;
+    }
     const result: any = {
       task: task.id,
       durationMs: duration,
@@ -547,6 +660,13 @@ ${testResultsSection}
       testOutput,
       judgeScore: finalScore,
       judgeRationale: rationale,
+      judgeModelScore: judgeScore,   // raw LLM judge verdict (null if unparseable)
+      judgeParseFailed,
+      judgeAttempts: judgeAttemptsUsed,
+      scoreSource,                   // "container-test" (SWE ground truth) | "judge" | "judge-parse-failed"
+      judgeModel: judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
+      timedOut,
+      loopRecoveries,
     };
     if (isSweContainer) {
       result.sweContainerTest = true;
@@ -595,16 +715,38 @@ async function main() {
       port: { type: "string" },
       "inference-profile": { type: "string" },
       "print-output-dir": { type: "boolean" },
+      "exclude-tools": { type: "string" },
     },
     allowPositionals: true,
   });
+
+  // Tools disabled by default for benchmark integrity: an agent that can search
+  // or fetch the web could just look up the real upstream fix instead of
+  // solving the task. Pass --exclude-tools with a comma-separated list to
+  // override (e.g. "none" to allow everything, or a different tool list).
+  const DEFAULT_EXCLUDED_TOOLS = ["web_search", "web_fetch"];
+  let excludeTools: string[];
+  if (values["exclude-tools"] !== undefined) {
+    const raw = (values["exclude-tools"] as string).trim();
+    excludeTools = raw === "" || raw.toLowerCase() === "none"
+      ? []
+      : raw.split(",").map((t) => t.trim()).filter(Boolean);
+  } else {
+    excludeTools = DEFAULT_EXCLUDED_TOOLS;
+  }
+  // console.error, not console.log: --print-output-dir's only stdout contract
+  // is the directory path (run-swe-bench.sh captures it via `$(...)`), and
+  // this line runs before that check on every invocation.
+  if (excludeTools.length > 0 && !values["print-output-dir"]) {
+    console.error(`[INFO] Excluding tools: ${excludeTools.join(", ")}`);
+  }
 
   // --provider takes precedence, --engine is a backward-compat alias
   const provider = (values.provider || values.engine || "llama.cpp") as string;
 
   const targetPath = positionals[0];
   if (!targetPath && !values["print-output-dir"]) {
-    console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params]");
+    console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params] [--exclude-tools web_search,web_fetch|none]");
     process.exit(1);
   }
 
@@ -625,8 +767,8 @@ async function main() {
   let judgeModelReq;
   if (values["judge-model"]) {
     const parts = values["judge-model"].split("/");
-    judgeModelReq = parts.length > 1 ? getModel(parts[0] as any, parts[1]) : undefined;
-    if (!judgeModelReq && !values["print-output-dir"]) console.warn(`[WARN] Could not resolve judge model ${values["judge-model"]}. Using default.`);
+    judgeModelReq = parts.length > 1 ? { provider: parts[0] as any, id: parts.slice(1).join("/") } : undefined;
+    if (!judgeModelReq && !values["print-output-dir"]) console.warn(`[WARN] Could not parse judge model ${values["judge-model"]} (expected provider/model-id). Using default.`);
   }
 
   const modelTag = values["model-tag"] as string | undefined;
@@ -699,7 +841,11 @@ async function main() {
     modelTag,
     backend: provider,
     rocm: values["rocm-version"],
-    exactModelId
+    exactModelId,
+    agentModel: agentModelReq ? `${agentModelReq.provider}/${agentModelReq.id}` : undefined,
+    judgeModel: judgeModelReq ? `${judgeModelReq.provider}/${judgeModelReq.id}` : "default (same as agent)",
+    timeoutMin,
+    excludeTools: excludeTools.length > 0 ? excludeTools : undefined,
   };
   if (values["inference-profile"]) {
     runMeta.inferenceProfile = values["inference-profile"];
@@ -735,7 +881,7 @@ async function main() {
       console.warn(`[WARN] Could not pre-parse task file ${f} for resume check.`);
     }
 
-    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride);
+    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools);
     results.push(res);
     if (res.judgeScore === 1) passed++;
     totalDuration += res.durationMs;

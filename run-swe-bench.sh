@@ -12,8 +12,14 @@ set -e
 #   1. Iterates over task files in the given directory (or runs a single task file)
 #   2. For each task, launches the corresponding SWE-bench container
 #   3. Installs bun + pi-bench deps inside the container (cached via Docker volume)
-#   4. Runs the benchmark: agent works in /testbed, then FAIL_TO_PASS tests are executed
-#   5. Results are written back to the host via the bind-mounted pi-bench directory
+#   4. Mounts your ~/.pi/agent extensions/skills/prompts/settings.json read-only
+#      (see the RESOURCE_MOUNTS block below) -- auth.json/sessions/models-store.json
+#      are NOT mounted, so model/judge credentials still come from .env
+#   5. Commits a benchmark-baseline in /testbed before the agent runs, so the
+#      agent's diff excludes pre-existing image noise (setup.py/tox.ini/etc.)
+#   6. Runs the benchmark: agent works in /testbed, then FAIL_TO_PASS tests decide
+#      the score (ground truth) -- the LLM judge only explains why
+#   7. Results are written back to the host via the bind-mounted pi-bench directory
 
 TARGET="${1:?Usage: ./run-swe-bench.sh <task-file-or-dir> [extra-args...]}"
 shift
@@ -37,6 +43,38 @@ PI_BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Create persistent bun cache volume (shared across all container runs)
 docker volume create pi-bench-bun-cache 2>/dev/null || true
+
+# Mount only the specific ~/.pi/agent resources pi-coding-agent's resource
+# loader discovers (extensions, skills, prompts, settings, context file, and
+# already npm-installed extension packages), each read-only. Deliberately
+# NOT the whole ~/.pi/agent directory: auth.json, sessions/, and
+# models-store.json stay purely container-local -- the credential store
+# needs to create a short-lived auth.json.lock directory even for reads that
+# ultimately fall through to env vars, and a read-only mount of the whole
+# tree breaks that with EROFS. Mounting npm/ read-only (rather than leaving
+# it unmounted) matters too: settings.json can declare npm: extension
+# sources (e.g. "npm:pi-lens"), and createAgentSession() tries to
+# `npm install` any that aren't already present -- these containers don't
+# have npm on PATH, so without this mount that install crashes the run.
+AGENT_DIR="$HOME/.pi/agent"
+RESOURCE_MOUNTS=""
+for name in extensions skills prompts agents settings.json AGENTS.md npm; do
+  if [ -e "$AGENT_DIR/$name" ]; then
+    RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $AGENT_DIR/$name:/root/.pi/agent/$name:ro"
+  fi
+done
+
+# ~/.pi/agent/extensions is commonly a symlink into a separate config repo
+# (e.g. ~/pi-config). A bind mount doesn't rewrite symlink targets, so mount
+# the real target at its identical absolute path too, or the symlink dangles
+# inside the container.
+EXTENSIONS_MOUNT=""
+if [ -L "$AGENT_DIR/extensions" ]; then
+  REAL_EXT_DIR="$(cd -P "$AGENT_DIR/extensions" 2>/dev/null && pwd)"
+  if [ -n "$REAL_EXT_DIR" ] && [ "$REAL_EXT_DIR" != "$AGENT_DIR/extensions" ]; then
+    EXTENSIONS_MOUNT="-v $REAL_EXT_DIR:$REAL_EXT_DIR:ro"
+  fi
+fi
 
 # Collect env file args
 ENV_ARGS=""
@@ -109,6 +147,8 @@ for task_file in "${TASK_FILES[@]}"; do
     docker run --init -it --rm --network host $ENV_ARGS \
       -v "$PI_BENCH_DIR:/pi-bench:z" \
       -v "pi-bench-bun-cache:/root/.bun" \
+      $RESOURCE_MOUNTS \
+      $EXTENSIONS_MOUNT \
       "$IMAGE" \
       bash -c "
         set -e
