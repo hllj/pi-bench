@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildAgentPrompt, buildSweEnvInstruction } from "./prompts";
+import { buildVerificationRetryPrompt } from "./prompts";
 
 describe("buildSweEnvInstruction", () => {
   test("returns empty string when not running in an SWE container", () => {
@@ -41,5 +42,23 @@ describe("buildAgentPrompt", () => {
   test("omits SWE-specific instructions for non-container runs", () => {
     const prompt = buildAgentPrompt({ tmpDir: "/tmp/x", isSweContainer: false, taskPrompt: "Fix bug Y." });
     expect(prompt).not.toContain("INFINITE LOOP PREVENTION");
+  });
+});
+
+describe("buildVerificationRetryPrompt", () => {
+  test("includes the truncated test output and the original failToPass list", () => {
+    const prompt = buildVerificationRetryPrompt(
+      "STDOUT:\nFAIL: test_foo (module.TestCase)\nAssertionError: expected 1, got 2\nSTDERR:\n",
+      { failToPass: ["test_foo (module.TestCase)", "test_bar (module.TestCase)"] }
+    );
+    expect(prompt).toContain("test_foo (module.TestCase)");
+    expect(prompt).toContain("AssertionError: expected 1, got 2");
+    expect(prompt.toLowerCase()).toContain("still fail");
+  });
+
+  test("truncates very long test output to a bounded length", () => {
+    const hugeOutput = "x".repeat(10000);
+    const prompt = buildVerificationRetryPrompt(hugeOutput, { failToPass: ["test_foo"] });
+    expect(prompt.length).toBeLessThan(6000);
   });
 });

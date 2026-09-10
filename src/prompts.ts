@@ -32,3 +32,25 @@ ${sweEnvInstruction}
 Issue Description:
 ${taskPrompt}`;
 }
+
+// Feeds the REAL FAIL_TO_PASS test failure back to the agent for one more
+// correction pass, instead of only discovering it post-hoc via the judge.
+// Targets the dominant genuine-failure pattern: the agent runs a narrow,
+// self-selected test subset, declares "done, verified," and ships a
+// regression the real acceptance tests catch.
+export function buildVerificationRetryPrompt(testOutput: string, task: { failToPass?: string[] }): string {
+  const MAX_OUTPUT_CHARS = 4000;
+  const truncated = testOutput.length > MAX_OUTPUT_CHARS
+    ? testOutput.slice(0, MAX_OUTPUT_CHARS) + "\n... [TRUNCATED]"
+    : testOutput;
+  const testList = (task.failToPass || []).map((t) => `  - ${t}`).join("\n");
+  return `Your fix still fails the required acceptance tests. This is the REAL test output (not a subset you chose) - read it carefully and fix the actual cause, don't just tweak the test:
+
+Required tests that must pass:
+${testList}
+
+Test output:
+${truncated}
+
+Fix the code so these tests pass, then stop. Do not modify the test files themselves to make them pass artificially.`;
+}

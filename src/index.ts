@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
 import { parseJudgeOutput } from "./judge";
-import { buildAgentPrompt } from "./prompts";
+import { buildAgentPrompt, buildVerificationRetryPrompt } from "./prompts";
 import { trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
 
 const execAsync = promisify(exec);
@@ -45,6 +45,22 @@ function buildSweTestCommand(task: any): string {
 
   // Generic fallback: run pytest
   return `cd /testbed && ${python} -m pytest --tb=short`;
+}
+
+async function runSweBenchTestCommand(tmpDir: string, task: any): Promise<{ testExitCode: number; testOutput: string }> {
+  const sweTestCmd = buildSweTestCommand(task);
+  console.log(`[INFO] SWE test command: ${sweTestCmd}`);
+  try {
+    const { stdout, stderr } = await execAsync(sweTestCmd, {
+      cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: 300_000
+    });
+    console.log(`[INFO] SWE-bench test exit code: 0`);
+    return { testExitCode: 0, testOutput: `STDOUT:\n${stdout}\nSTDERR:\n${stderr}` };
+  } catch (error: any) {
+    const testExitCode = error.code ?? 1;
+    console.log(`[INFO] SWE-bench test exit code: ${testExitCode}`);
+    return { testExitCode, testOutput: `STDOUT:\n${error.stdout || ""}\nSTDERR:\n${error.stderr || ""}\nERROR: ${error.message}` };
+  }
 }
 
 async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[]) {
@@ -386,6 +402,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
 
     let testOutput = "";
     let testExitCode: number | null = null;
+    let verificationRetries = 0;
 
     // SWE-bench container test evaluation: apply test patch and run FAIL_TO_PASS tests
     if (isSweContainer && task.failToPass && task.failToPass.length > 0) {
@@ -430,19 +447,28 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       }
 
       // Run the test command appropriate for this repo
-      const sweTestCmd = buildSweTestCommand(task);
-      console.log(`[INFO] SWE test command: ${sweTestCmd}`);
-      try {
-        const { stdout, stderr } = await execAsync(sweTestCmd, {
-          cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: 300_000
-        });
-        testExitCode = 0;
-        testOutput = `STDOUT:\n${stdout}\nSTDERR:\n${stderr}`;
-      } catch (error: any) {
-        testExitCode = error.code ?? 1;
-        testOutput = `STDOUT:\n${error.stdout || ""}\nSTDERR:\n${error.stderr || ""}\nERROR: ${error.message}`;
+      ({ testExitCode, testOutput } = await runSweBenchTestCommand(tmpDir, task));
+
+      // One-shot verification retry: if the REAL acceptance tests failed, give
+      // the agent exactly one more corrective pass with the actual failure
+      // output (instead of only discovering it post-hoc via the judge), then
+      // re-run the tests once more before finalizing the result.
+      if (testExitCode !== 0 && !timedOut && (!lastAssistant || lastAssistant.stopReason !== "error")) {
+        console.log(`\n[INFO] Fix failed the real acceptance tests. Giving the agent one corrective pass with the actual failure output...`);
+        const retryPrompt = buildVerificationRetryPrompt(testOutput, task);
+        try {
+          await runPromptWithLoopDetection(retryPrompt);
+        } catch (err: any) {
+          if (err.message !== "AGENT_TIMEOUT") throw err;
+        }
+        verificationRetries = 1;
+
+        console.log(`[INFO] Re-extracting diff after verification retry...`);
+        diff = await getDiff();
+
+        console.log(`[INFO] Re-running SWE-bench FAIL_TO_PASS tests after retry...`);
+        ({ testExitCode, testOutput } = await runSweBenchTestCommand(tmpDir, task));
       }
-      console.log(`[INFO] SWE-bench test exit code: ${testExitCode}`);
     } else {
       // Original flow for non-SWE tasks
       if (task.testPatch) {
@@ -623,6 +649,7 @@ ${testResultsSection}
       judgeModel: judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
       timedOut,
       loopRecoveries,
+      verificationRetries,
     };
     if (isSweContainer) {
       result.sweContainerTest = true;
