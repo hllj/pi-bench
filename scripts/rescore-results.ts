@@ -1,5 +1,5 @@
 import { readFile, readdir, writeFile } from "node:fs/promises";
-import { join, basename } from "node:path";
+import { join } from "node:path";
 
 export interface BenchResult {
   task: string;
@@ -13,7 +13,7 @@ export interface BenchResult {
 
 export interface RescoreSummary {
   totalFiles: number;
-  rescoredFiles: string[];
+  rescoredFiles: { task: string; from: number; to: number }[];
   oldPassRate: number;
   newPassRate: number;
 }
@@ -38,7 +38,7 @@ export async function rescoreResultsDir(dirPath: string): Promise<RescoreSummary
     (f) => f.startsWith("results-") && f.endsWith(".json")
   );
 
-  const rescoredFiles: string[] = [];
+  const rescoredFiles: { task: string; from: number; to: number }[] = [];
   let oldPassed = 0;
   let newPassed = 0;
 
@@ -49,10 +49,11 @@ export async function rescoreResultsDir(dirPath: string): Promise<RescoreSummary
 
     const { judgeScore, rescored } = computeGroundTruthScore(result);
     if (rescored) {
+      const oldScore = result.judgeScore;
       result.judgeScore = judgeScore;
       result.scoreSource = "container-test-rescore";
       await writeFile(filePath, JSON.stringify(result, null, 2));
-      rescoredFiles.push(result.task);
+      rescoredFiles.push({ task: result.task, from: oldScore, to: judgeScore });
     }
     if (judgeScore === 1) newPassed++;
   }
@@ -89,6 +90,6 @@ if (import.meta.main) {
   }
   const summary = await rescoreResultsDir(dir);
   console.log(`[INFO] Rescored ${summary.rescoredFiles.length}/${summary.totalFiles} result files in ${dir}`);
-  for (const task of summary.rescoredFiles) console.log(`  - ${task}: 0 -> 1`);
+  for (const r of summary.rescoredFiles) console.log(`  - ${r.task}: ${r.from} -> ${r.to}`);
   console.log(`[INFO] Pass rate: ${(summary.oldPassRate * 100).toFixed(1)}% -> ${(summary.newPassRate * 100).toFixed(1)}%`);
 }
