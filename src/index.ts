@@ -1,10 +1,9 @@
 import {
-  AuthStorage,
   createAgentSession,
   ModelRegistry,
+  ModelRuntime,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
-import { getModel } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-coding-agent";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -12,6 +11,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
+import { parseJudgeOutput } from "./judge";
+import { buildAgentPrompt, buildVerificationRetryPrompt } from "./prompts";
+import { trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
 
 const execAsync = promisify(exec);
 
@@ -45,7 +47,72 @@ function buildSweTestCommand(task: any): string {
   return `cd /testbed && ${python} -m pytest --tb=short`;
 }
 
-async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number) {
+// Restores the repo's standard test directories to HEAD and drops any
+// untracked files the agent added there. Used before EVERY acceptance-test
+// run so (a) the official SWE-bench test patch applies cleanly and (b) the
+// agent can never force a pass by editing the tests it is scored against.
+// IMPORTANT: Each directory MUST be reverted in its own command.
+// Passing multiple paths (e.g. `git checkout -- tests/ test/ testing/`)
+// causes git to abort the ENTIRE operation if ANY pathspec doesn't match,
+// silently leaving all test files un-reverted.
+async function revertAgentTestModifications(tmpDir: string): Promise<void> {
+  console.log(`[INFO] Reverting agent test modifications to avoid conflicts...`);
+  for (const testDir of ['tests/', 'test/', 'testing/']) {
+    try {
+      // Single atomic operation: restores both index and working tree to HEAD
+      await execAsync(`git checkout HEAD -- ${testDir}`, { cwd: tmpDir });
+      console.log(`[INFO] Reverted ${testDir} to HEAD.`);
+    } catch {
+      // Directory doesn't exist in this repo — expected, not an error
+    }
+  }
+  // Clean any untracked files the agent may have added in test directories
+  await execAsync(`git clean -fd tests/ test/ testing/ 2>/dev/null || true`, { cwd: tmpDir });
+}
+
+// Writes and applies the official SWE-bench test patch. The patch file is
+// always removed afterwards (even on failure) so that a later `git add .`
+// (see getDiff) can never stage the official test patch into the agent's
+// stored diff.
+async function applySweTestPatch(tmpDir: string, testPatch: string): Promise<void> {
+  const patchPath = join(tmpDir, "swe_test.patch");
+  await writeFile(patchPath, testPatch);
+  try {
+    try {
+      await execAsync(`git apply swe_test.patch`, { cwd: tmpDir });
+    } catch {
+      console.log(`[INFO] Standard git apply failed, trying 3-way merge...`);
+      await execAsync(`git apply --3way swe_test.patch`, { cwd: tmpDir });
+    }
+    console.log(`[INFO] Test patch applied successfully.`);
+  } finally {
+    await rm(patchPath, { force: true });
+  }
+}
+
+// Full "make the acceptance tests pristine again, then install them" sequence.
+async function revertAndApplySweTestPatch(tmpDir: string, testPatch: string): Promise<void> {
+  await revertAgentTestModifications(tmpDir);
+  await applySweTestPatch(tmpDir, testPatch);
+}
+
+async function runSweBenchTestCommand(tmpDir: string, task: any): Promise<{ testExitCode: number; testOutput: string }> {
+  const sweTestCmd = buildSweTestCommand(task);
+  console.log(`[INFO] SWE test command: ${sweTestCmd}`);
+  try {
+    const { stdout, stderr } = await execAsync(sweTestCmd, {
+      cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: 300_000
+    });
+    console.log(`[INFO] SWE-bench test exit code: 0`);
+    return { testExitCode: 0, testOutput: `STDOUT:\n${stdout}\nSTDERR:\n${stderr}` };
+  } catch (error: any) {
+    const testExitCode = error.code ?? 1;
+    console.log(`[INFO] SWE-bench test exit code: ${testExitCode}`);
+    return { testExitCode, testOutput: `STDOUT:\n${error.stdout || ""}\nSTDERR:\n${error.stderr || ""}\nERROR: ${error.message}` };
+  }
+}
+
+async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[]) {
   const taskContent = await readFile(taskFile, "utf-8");
   const task = JSON.parse(taskContent);
 
@@ -61,10 +128,16 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
   try {
     if (isSweContainer) {
       console.log(`[INFO] Using pre-configured SWE-bench testbed at ${sweTestbed}`);
-      // Ensure git is initialized in /testbed for diff extraction
+      // Ensure git is initialized, then commit a clean baseline so pre-existing
+      // image noise (e.g. setup.py/tox.ini/CHANGES shipped dirty) is NOT
+      // attributed to the agent's diff. The agent's changes are then diffed
+      // against this baseline exactly.
       try { await execAsync(`git status`, { cwd: tmpDir }); } catch {
-        await execAsync(`git init && git add -A && git commit -m "baseline" --allow-empty`, { cwd: tmpDir });
+        await execAsync(`git init`, { cwd: tmpDir });
       }
+      await execAsync(`git add -A`, { cwd: tmpDir });
+      await execAsync(`git -c user.email=bench@pi.local -c user.name="Pi Benchmarker" commit -m "benchmark-baseline" --allow-empty`, { cwd: tmpDir });
+      console.log(`[INFO] Baseline commit created (pre-existing image changes excluded from agent diff).`);
     } else {
       console.log(`[INFO] Cloning ${task.repo} at commit ${task.commit}...`);
       await execAsync(`git init`, { cwd: tmpDir });
@@ -75,10 +148,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     }
 
     console.log(`[INFO] Initializing agent session...`);
-    const authStorage = AuthStorage.create();
 
     const localModelsPath = join(process.cwd(), "models.json");
-    let modelRegistry;
+    let modelsPath: string | undefined;
     if (existsSync(localModelsPath)) {
       console.log(`[INFO] Using local models.json configuration`);
       if (port) {
@@ -89,9 +161,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         }
         const tmpModelsPath = tmpDir + "-models.json";
         await writeFile(tmpModelsPath, JSON.stringify(modelsData));
-        modelRegistry = ModelRegistry.create(authStorage, tmpModelsPath);
+        modelsPath = tmpModelsPath;
       } else {
-        modelRegistry = ModelRegistry.create(authStorage, localModelsPath);
+        modelsPath = localModelsPath;
       }
     } else {
       if (port) {
@@ -107,11 +179,12 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         };
         const tmpModelsPath = tmpDir + "-models.json";
         await writeFile(tmpModelsPath, JSON.stringify(modelsData));
-        modelRegistry = ModelRegistry.create(authStorage, tmpModelsPath);
-      } else {
-        modelRegistry = ModelRegistry.create(authStorage);
+        modelsPath = tmpModelsPath;
       }
     }
+
+    const modelRuntime = await ModelRuntime.create(modelsPath ? { modelsPath } : undefined);
+    const modelRegistry = new ModelRegistry(modelRuntime);
 
     let resolvedAgentModel;
     if (agentModelReq) {
@@ -120,7 +193,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         throw new Error(`Could not find model ${agentModelReq.provider}/${agentModelReq.id} in registry`);
       }
     } else {
-      const providerModels = modelRegistry.getAll().filter(m => m.provider === provider);
+      const providerModels = modelRegistry.getAll().filter((m: any) => m.provider === provider);
       if (providerModels.length > 0) {
         resolvedAgentModel = providerModels[0];
         console.log(`[INFO] No agent model specified, defaulting to ${resolvedAgentModel.provider}/${resolvedAgentModel.id}`);
@@ -136,10 +209,19 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     const { session } = await createAgentSession({
       cwd: tmpDir,
       sessionManager: SessionManager.inMemory(tmpDir),
-      authStorage,
-      modelRegistry,
+      modelRuntime,
       model: resolvedAgentModel,
+      excludeTools: excludeTools && excludeTools.length > 0 ? excludeTools : undefined,
     });
+
+    // createAgentSession() activates extension tools via a synchronous snapshot
+    // taken during construction, racing against async extension loading (jiti
+    // dynamic imports). Large extensions like pi-config's `subagent` can lose
+    // that race and end up registered but not active - the model then sees no
+    // subagent/run_workflow tool at all. Re-sync from the full registry now
+    // that extension loading has settled; this only adds tools, it can't
+    // reintroduce anything excludeTools already filtered out of the registry.
+    session.setActiveToolsByName(session.getAllTools().map((t) => t.name));
 
     console.log(`[INFO] Agent resolved to model: ${session.model?.provider}/${session.model?.id}`);
 
@@ -147,6 +229,12 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     let lastToolArgs = "";
     let repeatedToolCount = 0;
     let loopDetected = false;
+    let loopRecoveries = 0;
+
+    let archaeologyState: ArchaeologyState = { count: 0 };
+    let archaeologyNudgeNeeded = false;
+    let archaeologyNudgesUsed = 0;
+    const maxArchaeologyNudges = 2;
 
     session.subscribe((event) => {
       if (event.type === "message_update" && event.assistantMessageEvent) {
@@ -174,6 +262,12 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
             session.abort();
           }
 
+          if (!loopDetected && !archaeologyNudgeNeeded && trackGitArchaeology(archaeologyState, event.toolName, argsStr)) {
+            console.warn(`\n[WARN] Git-archaeology streak detected (${archaeologyState.count} history calls, no edits). Nudging agent to make a change.`);
+            archaeologyNudgeNeeded = true;
+            session.abort();
+          }
+
           if (argsStr.length > 200) argsStr = argsStr.substring(0, 200) + "...";
         } catch (e) { }
         console.log(`\n[AGENT] Started using tool: ${event.toolName} with args: ${argsStr}`);
@@ -193,22 +287,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
 
     console.log(`\n--- Agent output ---`);
     const start = Date.now();
-    const sweEnvInstruction = isSweContainer
-      ? `7. The development environment is already fully configured with the correct Python version and all dependencies pre-installed. Do NOT install packages, create virtual environments, or modify the Python installation. Just focus on understanding and fixing the bug.\n8. If necessary you can write tests or modify existing tests to verify your fix. Avoid running the entire test suite though, if you can only focus on tests that are relevant to the code you're changing to ensure you're not introducing regressions.\n9. Make the MINIMAL changes necessary to fix the issue. Do not refactor unrelated code.\n10. TIME EFFICIENCY - Do NOT waste time on:\n    - Unnecessary git archaeology (git log, git show). Focus on the CURRENT code, not its history, unless you deem it essential to fix the issue.\n    - Re-running the same test with different pipe/grep/tail flags. Capture the full output ONCE and read it.\n    - Guessing test class/function names. If unsure, grep for the class name first BEFORE running.\n11. INFINITE LOOP PREVENTION - When running test suites or scripts that execute code you have modified, wrap the command with \`timeout\` to guard against inadvertent infinite loops (e.g., \`timeout 300 python -m pytest tests/test_xxx.py -xvs\`). No single test run should need more than 5 minutes.`
-      : "";
-    const agentPrompt = `You are an expert AI coding assistant. The target repository has ALREADY been cloned into your CURRENT WORKING DIRECTORY (\`${tmpDir}\`). 
-
-CRITICAL INSTRUCTIONS:
-1. Do NOT use \`git clone\` or download any repositories. The code is already here.
-2. ALL your work (fixes and tests) must be done STRICTLY within your current working directory. Use relative paths (e.g., \`.\`) instead of absolute paths.
-3. Do NOT explore, read, or modify files outside of your current working directory.
-4. Focus only on fixing the issue described below and verifying your fix with tests.
-5. You are running completely autonomously. There is NO human interaction. You must independently investigate, write the fix, verify it, and then STOP calling tools when you are done.
-6. You are to complete the task and produce changes editing the files in this project. Do not stop without editing the files required to complete the task!
-${sweEnvInstruction}
-
-Issue Description:
-${task.prompt}`;
+    const agentPrompt = buildAgentPrompt({ tmpDir, isSweContainer, taskPrompt: task.prompt });
     const timeoutMs = timeoutMin * 60 * 1000;
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error("AGENT_TIMEOUT")), timeoutMs);
@@ -227,14 +306,35 @@ ${task.prompt}`;
             timeoutPromise
           ]);
           if (loopDetected) throw new Error("LOOP_DETECTED");
+          if (archaeologyNudgeNeeded) throw new Error("ARCHAEOLOGY_NUDGE");
           break; // Finished successfully
         } catch (err: any) {
           if (err.message === "AGENT_TIMEOUT") {
             console.error(`\n[ERROR] Agent execution timed out after ${timeoutMin} minutes. Aborting...`);
             await session.abort();
             timedOut = true;
+          } else if (archaeologyNudgeNeeded || err.message === "ARCHAEOLOGY_NUDGE") {
+            // MUST be checked BEFORE the loop-detection branch: the archaeology
+            // detector also calls session.abort(), and the loop branch's generic
+            // `AbortError` / "abort" clauses would otherwise swallow an
+            // archaeology abort (corrupting loopRecoveries, sending the wrong
+            // steer message, and leaving archaeologyNudgeNeeded set so the next
+            // prompt throws immediately). This branch has no catch-all clauses,
+            // so a genuine loop abort (loopDetected === true, set synchronously
+            // before the abort) still falls through to the loop branch below.
+            archaeologyNudgeNeeded = false;
+            archaeologyState.count = 0;
+            if (archaeologyNudgesUsed >= maxArchaeologyNudges) {
+              console.log(`\n[INFO] Archaeology nudge budget exhausted (${archaeologyNudgesUsed}/${maxArchaeologyNudges}) — letting normal flow continue.`);
+              break;
+            }
+            archaeologyNudgesUsed++;
+            console.log(`\n[INFO] Recovering from git-archaeology streak (${archaeologyNudgesUsed}/${maxArchaeologyNudges})... Prompting agent to stop investigating history.`);
+            currentPrompt = `SYSTEM WARNING: You have spent several tool calls exploring git history (log/show/blame) without editing any file. Per your instructions, git archaeology should only be used if essential - stop investigating history now and make the code change based on what you already know. If you are genuinely blocked, make your best-effort fix now rather than continuing to investigate.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
+            maxLoops--;
           } else if (loopDetected || err.message === "LOOP_DETECTED" || err.name === "AbortError" || err.message?.includes("abort")) {
             console.log(`\n[INFO] Recovering from tool loop... Prompting agent to try something else.`);
+            loopRecoveries++;
             currentPrompt = `SYSTEM WARNING: You are repeatedly calling the tool \`${lastToolName}\` with the exact same arguments: \`${lastToolArgs}\`. This is an infinite loop. The last execution was aborted. You MUST try a completely different approach, use different arguments, or implement the fix now.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
             loopDetected = false;
             repeatedToolCount = 0;
@@ -371,6 +471,7 @@ ${task.prompt}`;
 
     let testOutput = "";
     let testExitCode: number | null = null;
+    let verificationRetries = 0;
 
     // SWE-bench container test evaluation: apply test patch and run FAIL_TO_PASS tests
     if (isSweContainer && task.failToPass && task.failToPass.length > 0) {
@@ -380,54 +481,74 @@ ${task.prompt}`;
       if (task.testPatch) {
         console.log(`[INFO] Applying SWE-bench test patch...`);
         try {
-          const patchPath = join(tmpDir, "swe_test.patch");
-          await writeFile(patchPath, task.testPatch);
-
-          // Revert any changes the agent made to standard test directories
-          // to prevent patch conflicts with the SWE-bench evaluation testPatch.
-          // IMPORTANT: Each directory MUST be reverted in its own command.
-          // Passing multiple paths (e.g. `git checkout -- tests/ test/ testing/`)
-          // causes git to abort the ENTIRE operation if ANY pathspec doesn't match,
-          // silently leaving all test files un-reverted.
-          console.log(`[INFO] Reverting agent test modifications to avoid conflicts...`);
-          for (const testDir of ['tests/', 'test/', 'testing/']) {
-            try {
-              // Single atomic operation: restores both index and working tree to HEAD
-              await execAsync(`git checkout HEAD -- ${testDir}`, { cwd: tmpDir });
-              console.log(`[INFO] Reverted ${testDir} to HEAD.`);
-            } catch {
-              // Directory doesn't exist in this repo — expected, not an error
-            }
-          }
-          // Clean any untracked files the agent may have added in test directories
-          await execAsync(`git clean -fd tests/ test/ testing/ 2>/dev/null || true`, { cwd: tmpDir });
-
-          try {
-            await execAsync(`git apply swe_test.patch`, { cwd: tmpDir });
-          } catch {
-            console.log(`[INFO] Standard git apply failed, trying 3-way merge...`);
-            await execAsync(`git apply --3way swe_test.patch`, { cwd: tmpDir });
-          }
-          console.log(`[INFO] Test patch applied successfully.`);
+          await revertAndApplySweTestPatch(tmpDir, task.testPatch);
         } catch (e) {
           console.warn(`[WARN] Failed to apply test patch:`, e);
         }
       }
 
       // Run the test command appropriate for this repo
-      const sweTestCmd = buildSweTestCommand(task);
-      console.log(`[INFO] SWE test command: ${sweTestCmd}`);
-      try {
-        const { stdout, stderr } = await execAsync(sweTestCmd, {
-          cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: 300_000
-        });
-        testExitCode = 0;
-        testOutput = `STDOUT:\n${stdout}\nSTDERR:\n${stderr}`;
-      } catch (error: any) {
-        testExitCode = error.code ?? 1;
-        testOutput = `STDOUT:\n${error.stdout || ""}\nSTDERR:\n${error.stderr || ""}\nERROR: ${error.message}`;
+      ({ testExitCode, testOutput } = await runSweBenchTestCommand(tmpDir, task));
+
+      // One-shot verification retry: if the REAL acceptance tests failed, give
+      // the agent exactly one more corrective pass with the actual failure
+      // output (instead of only discovering it post-hoc via the judge), then
+      // re-run the tests once more before finalizing the result.
+      if (testExitCode !== 0 && !timedOut && (!lastAssistant || lastAssistant.stopReason !== "error")) {
+        console.log(`\n[INFO] Fix failed the real acceptance tests. Giving the agent one corrective pass with the actual failure output...`);
+        const retryPrompt = buildVerificationRetryPrompt(testOutput, task);
+        // Fresh phase: a git-archaeology streak left over from the main prompt
+        // phase must not abort this focused corrective turn on its very first
+        // history call. (archaeologyNudgesUsed is deliberately NOT reset — it
+        // is an intentional whole-task budget, not a per-phase one.)
+        archaeologyState.count = 0;
+        try {
+          await runPromptWithLoopDetection(retryPrompt);
+        } catch (err: any) {
+          if (err.message !== "AGENT_TIMEOUT") throw err;
+        }
+
+        lastAssistant = [...session.messages].reverse().find(m => m.role === "assistant") as any;
+        if (lastAssistant && lastAssistant.stopReason === "error") {
+          const errorMsg = lastAssistant.errorMessage || "Unknown error";
+          const isConnectionError = /connection|fetch failed|socket|refused|lost|connect|timeout|timed out|500|502|503|504/i.test(errorMsg);
+          if (isConnectionError) {
+            throw new Error(`Inference backend is unreachable or crashed: ${errorMsg}`);
+          }
+        }
+
+        verificationRetries = 1;
+
+        // The retry turn had full bash/edit/write access AND was handed the
+        // exact failing test names, so restore the acceptance tests to HEAD
+        // BEFORE the diff is captured: (a) the agent must not be able to force
+        // a pass by editing the tests (testExitCode is the sole scoring
+        // authority), and (b) the stored diff must reflect only the agent's
+        // real change. Diff-then-apply mirrors the initial run's ordering
+        // (diff captured with no test patch applied).
+        if (task.testPatch) {
+          try {
+            await revertAgentTestModifications(tmpDir);
+          } catch (e) {
+            console.warn(`[WARN] Failed to revert agent test modifications:`, e);
+          }
+        }
+
+        console.log(`[INFO] Re-extracting diff after verification retry...`);
+        diff = await getDiff();
+
+        if (task.testPatch) {
+          console.log(`[INFO] Re-applying SWE-bench test patch before re-running tests...`);
+          try {
+            await applySweTestPatch(tmpDir, task.testPatch);
+          } catch (e) {
+            console.warn(`[WARN] Failed to apply test patch:`, e);
+          }
+        }
+
+        console.log(`[INFO] Re-running SWE-bench FAIL_TO_PASS tests after retry...`);
+        ({ testExitCode, testOutput } = await runSweBenchTestCommand(tmpDir, task));
       }
-      console.log(`[INFO] SWE-bench test exit code: ${testExitCode}`);
     } else {
       // Original flow for non-SWE tasks
       if (task.testPatch) {
@@ -456,8 +577,33 @@ ${task.prompt}`;
     }
 
     console.log(`[INFO] Running LLM judge...`);
-    const judgeModel = judgeModelReq || session.state.model;
+    // The resolved agent model (what the agent session actually uses) is the
+    // judge default here; keep a reference to detect self-grading correctly.
+    const defaultJudgeModel = session.state.model as any;
+    let judgeModel = defaultJudgeModel;
+    if (judgeModelReq) {
+      const resolvedJudgeModel = modelRegistry.find(judgeModelReq.provider, judgeModelReq.id);
+      if (resolvedJudgeModel) {
+        judgeModel = resolvedJudgeModel;
+      } else {
+        console.warn(`[WARN] Could not resolve judge model ${judgeModelReq.provider}/${judgeModelReq.id}. Using default.`);
+      }
+    }
     if (!judgeModel) throw new Error("Judge model not found");
+    // Self-grading check: compare against the RESOLVED agent model, on BOTH
+    // provider and id. Same id on a different provider (e.g. local ds4 vs
+    // openrouter both exposing "deepseek-v4-flash") is NOT self-grading, and
+    // comparing the raw CLI request would silently miss local-provider runs.
+    if (
+      defaultJudgeModel &&
+      judgeModel.provider === defaultJudgeModel.provider &&
+      judgeModel.id === defaultJudgeModel.id
+    ) {
+      console.warn(`\n[WARN] Judge model is the SAME as the agent model (${judgeModel.provider}/${judgeModel.id}) — the model is grading its own output.
+For SWE-bench tasks the container test now decides the score, so this only affects the rationale.
+Pass --judge-model (e.g. openrouter/deepseek/deepseek-v4-pro) for an independent judge.\n`);
+    }
+    console.log(`[INFO] Judge model: ${judgeModel.provider}/${judgeModel.id}`);
     const auth = await modelRegistry.getApiKeyAndHeaders(judgeModel);
     if (!auth.ok) throw new Error("Judge auth failed: " + auth.error);
 
@@ -473,13 +619,15 @@ ${task.prompt}`;
       }
     }
 
-    const judgeSystemPrompt = `You are an expert software engineer judging the output of an AI coding agent.
+    const judgeSystemPrompt = `You are an expert software engineer reviewing the output of an AI coding agent.
 You will be provided with the task prompt, the expected behavior, the git diff generated by the agent, and optionally a known correct "solution diff" and automated test output.
-Your job is to determine if the diff successfully accomplishes the task. If automated tests were run, consider them a strong signal, but NOT the absolute ground truth. 
-If a test fails (e.g., due to strict framework type assertions like expecting an integer instead of a string), but you determine the agent's code practically solves the user's issue in a valid way, you MAY still score it a 1. Provide a detailed rationale explaining why you bypassed the test failure.
+Your job is to determine if the diff successfully accomplishes the task and explain why (or why not).
+- If automated tests were run and PASSED, the patch is accepted: score 1 with a concise explanation.
+- If automated tests were run and FAILED, the patch did NOT satisfy the acceptance tests: score 0 unless you have a compelling reason the failure is unrelated to the change (e.g. a pre-existing/environment failure), which you must explain in the rationale.
+- If no automated tests were run, judge the diff on its own merits against the expected behavior and the known correct solution.
 Respond ONLY with a JSON object in this exact format, with no markdown wrapping:
 {
-  "score": 1,
+  "score": 0 or 1,
   "rationale": "Explanation for the score"
 }`;
 
@@ -509,36 +657,63 @@ ${testResultsSection}
 `;
 
     let judgeOutput = "";
-    const { streamSimple } = await import("@mariozechner/pi-ai");
-    const stream = streamSimple(judgeModel, {
-      systemPrompt: judgeSystemPrompt,
-      messages: [{ role: "user", content: judgePrompt, timestamp: Date.now() }]
-    }, { apiKey: auth.apiKey, headers: auth.headers });
-
-    for await (const chunk of stream) {
-      if (chunk.type === "text_delta") {
-        judgeOutput += chunk.delta;
-      }
-      if (chunk.type === "error") {
-        console.error("[DEBUG] streamSimple error:", chunk.error);
-      }
-    }
-    console.log("[DEBUG] Raw judge output:", judgeOutput);
-
-    let score = 0;
+    let judgeScore: number | null = null;
     let rationale = "Failed to parse judge output";
-    try {
-      const jsonStr = judgeOutput.match(/\{[\s\S]*\}/)?.[0] || judgeOutput;
-      const parsed = JSON.parse(jsonStr);
-      score = parsed.score;
+    let judgeParseFailed = true;
+    let judgeAttemptsUsed = 0;
+    const maxJudgeAttempts = 3;
+    for (let attempt = 1; attempt <= maxJudgeAttempts; attempt++) {
+      judgeAttemptsUsed = attempt;
+      judgeOutput = "";
+      const stream = modelRuntime.streamSimple(judgeModel, {
+        systemPrompt: judgeSystemPrompt,
+        messages: [{ role: "user", content: judgePrompt, timestamp: Date.now() }]
+      }, { apiKey: auth.apiKey, headers: auth.headers });
+
+      for await (const chunk of stream) {
+        if (chunk.type === "text_delta") {
+          judgeOutput += chunk.delta;
+        }
+        if (chunk.type === "error") {
+          console.error("[DEBUG] streamSimple error:", chunk.error);
+        }
+      }
+      const preview = judgeOutput.length > 500 ? judgeOutput.slice(0, 500) + "... [TRUNCATED]" : judgeOutput;
+      console.log(`[DEBUG] Raw judge output (attempt ${attempt}/${maxJudgeAttempts}):`, preview);
+
+      const parsed = parseJudgeOutput(judgeOutput);
+      if (!parsed.parseFailed) {
+        judgeScore = parsed.score;
+        rationale = parsed.rationale;
+        judgeParseFailed = false;
+        break;
+      }
+      console.error(`[ERROR] Failed to parse judge output (attempt ${attempt}/${maxJudgeAttempts}): ${parsed.rationale.slice(0, 300)}`);
       rationale = parsed.rationale;
-    } catch (e) {
-      console.error("[ERROR] Failed to parse judge JSON", e);
-      rationale = judgeOutput;
+      if (attempt < maxJudgeAttempts) {
+        console.log(`[INFO] Retrying LLM judge...`);
+      }
     }
 
-    // The judge now provides the final score, taking test results into account but allowed to override them.
-    const finalScore = score;
+    // #1 Ground-truth-first scoring: for SWE-bench container tasks the
+    // FAIL_TO_PASS test result DECIDES the score; the LLM judge only explains
+    // (its raw verdict is recorded as judgeModelScore for later comparison).
+    // For other tasks the judge decides; unparseable judge output defaults to 0.
+    let scoreSource: "container-test" | "judge" | "judge-parse-failed" = "judge";
+    let finalScore: number = 0;
+    if (isSweContainer && task.failToPass && task.failToPass.length > 0 && testExitCode !== null) {
+      scoreSource = "container-test";
+      finalScore = testExitCode === 0 ? 1 : 0;
+      if (judgeScore !== null && judgeScore !== finalScore) {
+        console.log(`[INFO] Judge raw score ${judgeScore} but container test ${testExitCode === 0 ? "PASSED" : "FAILED"} (exit ${testExitCode}) — final score decided by the test.`);
+      }
+    } else if (judgeScore !== null && !judgeParseFailed) {
+      scoreSource = "judge";
+      finalScore = judgeScore === 1 ? 1 : 0;
+    } else {
+      scoreSource = "judge-parse-failed";
+      finalScore = 0;
+    }
     const result: any = {
       task: task.id,
       durationMs: duration,
@@ -547,6 +722,15 @@ ${testResultsSection}
       testOutput,
       judgeScore: finalScore,
       judgeRationale: rationale,
+      judgeModelScore: judgeScore,   // raw LLM judge verdict (null if unparseable)
+      judgeParseFailed,
+      judgeAttempts: judgeAttemptsUsed,
+      scoreSource,                   // "container-test" (SWE ground truth) | "judge" | "judge-parse-failed"
+      judgeModel: judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
+      timedOut,
+      loopRecoveries,
+      verificationRetries,
+      archaeologyNudges: archaeologyNudgesUsed,
     };
     if (isSweContainer) {
       result.sweContainerTest = true;
@@ -595,16 +779,42 @@ async function main() {
       port: { type: "string" },
       "inference-profile": { type: "string" },
       "print-output-dir": { type: "boolean" },
+      "exclude-tools": { type: "string" },
     },
     allowPositionals: true,
   });
+
+  // Tools disabled by default. web_search/web_fetch: benchmark integrity - an
+  // agent that can search or fetch the web could just look up the real
+  // upstream fix instead of solving the task. question/questionnaire: these
+  // always fail here (no human is ever attached to a benchmark run - they
+  // return a clean "UI not available" error rather than hanging, but a task
+  // reaching for one still burns a turn on something that can never succeed).
+  // Pass --exclude-tools with a comma-separated list to override (e.g. "none"
+  // to allow everything, or a different tool list).
+  const DEFAULT_EXCLUDED_TOOLS = ["web_search", "web_fetch", "question", "questionnaire"];
+  let excludeTools: string[];
+  if (values["exclude-tools"] !== undefined) {
+    const raw = (values["exclude-tools"] as string).trim();
+    excludeTools = raw === "" || raw.toLowerCase() === "none"
+      ? []
+      : raw.split(",").map((t) => t.trim()).filter(Boolean);
+  } else {
+    excludeTools = DEFAULT_EXCLUDED_TOOLS;
+  }
+  // console.error, not console.log: --print-output-dir's only stdout contract
+  // is the directory path (run-swe-bench.sh captures it via `$(...)`), and
+  // this line runs before that check on every invocation.
+  if (excludeTools.length > 0 && !values["print-output-dir"]) {
+    console.error(`[INFO] Excluding tools: ${excludeTools.join(", ")}`);
+  }
 
   // --provider takes precedence, --engine is a backward-compat alias
   const provider = (values.provider || values.engine || "llama.cpp") as string;
 
   const targetPath = positionals[0];
   if (!targetPath && !values["print-output-dir"]) {
-    console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params]");
+    console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params] [--exclude-tools web_search,web_fetch|none]");
     process.exit(1);
   }
 
@@ -625,8 +835,8 @@ async function main() {
   let judgeModelReq;
   if (values["judge-model"]) {
     const parts = values["judge-model"].split("/");
-    judgeModelReq = parts.length > 1 ? getModel(parts[0] as any, parts[1]) : undefined;
-    if (!judgeModelReq && !values["print-output-dir"]) console.warn(`[WARN] Could not resolve judge model ${values["judge-model"]}. Using default.`);
+    judgeModelReq = parts.length > 1 ? { provider: parts[0] as any, id: parts.slice(1).join("/") } : undefined;
+    if (!judgeModelReq && !values["print-output-dir"]) console.warn(`[WARN] Could not parse judge model ${values["judge-model"]} (expected provider/model-id). Using default.`);
   }
 
   const modelTag = values["model-tag"] as string | undefined;
@@ -699,7 +909,11 @@ async function main() {
     modelTag,
     backend: provider,
     rocm: values["rocm-version"],
-    exactModelId
+    exactModelId,
+    agentModel: agentModelReq ? `${agentModelReq.provider}/${agentModelReq.id}` : undefined,
+    judgeModel: judgeModelReq ? `${judgeModelReq.provider}/${judgeModelReq.id}` : "default (same as agent)",
+    timeoutMin,
+    excludeTools: excludeTools.length > 0 ? excludeTools : undefined,
   };
   if (values["inference-profile"]) {
     runMeta.inferenceProfile = values["inference-profile"];
@@ -735,7 +949,7 @@ async function main() {
       console.warn(`[WARN] Could not pre-parse task file ${f} for resume check.`);
     }
 
-    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride);
+    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools);
     results.push(res);
     if (res.judgeScore === 1) passed++;
     totalDuration += res.durationMs;
