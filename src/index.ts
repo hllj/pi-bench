@@ -214,6 +214,15 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       excludeTools: excludeTools && excludeTools.length > 0 ? excludeTools : undefined,
     });
 
+    // createAgentSession() activates extension tools via a synchronous snapshot
+    // taken during construction, racing against async extension loading (jiti
+    // dynamic imports). Large extensions like pi-config's `subagent` can lose
+    // that race and end up registered but not active - the model then sees no
+    // subagent/run_workflow tool at all. Re-sync from the full registry now
+    // that extension loading has settled; this only adds tools, it can't
+    // reintroduce anything excludeTools already filtered out of the registry.
+    session.setActiveToolsByName(session.getAllTools().map((t) => t.name));
+
     console.log(`[INFO] Agent resolved to model: ${session.model?.provider}/${session.model?.id}`);
 
     let lastToolName = "";
