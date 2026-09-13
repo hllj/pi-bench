@@ -14,17 +14,24 @@ set -e
 #   3. Installs bun + pi-bench deps inside the container (cached via Docker volume)
 #   4. Runs the benchmark: agent works in /testbed, then FAIL_TO_PASS tests are executed
 #   5. Results are written back to the host via the bind-mounted pi-bench directory
+#   6. Removes that task's image afterward (the full set is 100GB+ on disk) --
+#      pass --keep-images to keep them cached instead, for faster reruns
 
 TARGET="${1:?Usage: ./run-swe-bench.sh <task-file-or-dir> [extra-args...]}"
 shift
 
 PASS_COUNT=1
+KEEP_IMAGES=0
 EXTRA_ARGS=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --pass)
       PASS_COUNT="$2"
       shift 2
+      ;;
+    --keep-images)
+      KEEP_IMAGES=1
+      shift
       ;;
     *)
       EXTRA_ARGS="$EXTRA_ARGS $1"
@@ -207,6 +214,14 @@ if attempts:
   else
     FAILED=$((FAILED + 1))
     echo "[WARN] Task $TASK_ID failed after $ATTEMPT attempts"
+  fi
+
+  # Free disk space: the full task set's images add up to 100GB+, more than
+  # most machines have to spare, so remove this task's image now that we're
+  # done with it. Pass --keep-images to skip this and keep images cached for
+  # faster reruns, if you have the disk space for it.
+  if [ "$KEEP_IMAGES" != "1" ]; then
+    docker rmi "$IMAGE" >/dev/null 2>&1 || true
   fi
 done
 
