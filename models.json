@@ -24,12 +24,7 @@
         "maxTokensField": "max_tokens",
         "supportsStrictMode": false,
         "thinkingFormat": "deepseek",
-        "requiresReasoningContentOnAssistantMessages": true,
-        "openRouterRouting": {
-          "quantizations": [
-            "fp4"
-          ]
-        }
+        "requiresReasoningContentOnAssistantMessages": true
       },
       "models": [
         {
