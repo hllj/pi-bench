@@ -784,11 +784,15 @@ async function main() {
     allowPositionals: true,
   });
 
-  // Tools disabled by default for benchmark integrity: an agent that can search
-  // or fetch the web could just look up the real upstream fix instead of
-  // solving the task. Pass --exclude-tools with a comma-separated list to
-  // override (e.g. "none" to allow everything, or a different tool list).
-  const DEFAULT_EXCLUDED_TOOLS = ["web_search", "web_fetch"];
+  // Tools disabled by default. web_search/web_fetch: benchmark integrity - an
+  // agent that can search or fetch the web could just look up the real
+  // upstream fix instead of solving the task. question/questionnaire: these
+  // always fail here (no human is ever attached to a benchmark run - they
+  // return a clean "UI not available" error rather than hanging, but a task
+  // reaching for one still burns a turn on something that can never succeed).
+  // Pass --exclude-tools with a comma-separated list to override (e.g. "none"
+  // to allow everything, or a different tool list).
+  const DEFAULT_EXCLUDED_TOOLS = ["web_search", "web_fetch", "question", "questionnaire"];
   let excludeTools: string[];
   if (values["exclude-tools"] !== undefined) {
     const raw = (values["exclude-tools"] as string).trim();
