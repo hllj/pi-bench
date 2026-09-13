@@ -153,17 +153,24 @@ for task_file in "${TASK_FILES[@]}"; do
       bash -c "
         set -e
 
-        # Install unzip + bun (cached after first run via volume)
+        # Install unzip + ripgrep + bun (cached after first run via volume).
+        # apt-get update is retried a few times: under QEMU emulation (amd64
+        # image on an arm64 host) it can download a truncated package index,
+        # which then fails GPG verification -- almost always transient.
         if [ ! -f /root/.bun/bin/bun ]; then
           echo '[SETUP] Installing bun...'
-          apt-get update -qq && apt-get install -y -qq unzip >/dev/null 2>&1
+          for i in 1 2 3; do apt-get update -qq && break; rm -rf /var/lib/apt/lists/*; sleep 2; done
+          apt-get install -y -qq unzip ripgrep >/dev/null 2>&1
           curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
           echo '[SETUP] bun installed.'
         fi
         export PATH=/root/.bun/bin:\$PATH
 
-        # Ensure unzip is available (bun cache might exist from a previous run but unzip might not be in this container)
-        which unzip >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq unzip >/dev/null 2>&1; }
+        # Ensure unzip + ripgrep are available (bun cache might exist from a previous run but these might not be in this container)
+        if ! which unzip >/dev/null 2>&1 || ! which rg >/dev/null 2>&1; then
+          for i in 1 2 3; do apt-get update -qq && break; rm -rf /var/lib/apt/lists/*; sleep 2; done
+          apt-get install -y -qq unzip ripgrep >/dev/null 2>&1
+        fi
 
         # Install pi-bench dependencies (fast if node_modules exists from bind mount)
         cd /pi-bench && bun install --frozen-lockfile 2>/dev/null || bun install 2>/dev/null
