@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
+import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
 
 describe("trackGitArchaeology", () => {
   test("triggers after 3 git-history bash calls with no mutation in between", () => {
@@ -40,5 +40,29 @@ describe("trackGitArchaeology", () => {
     const state: ArchaeologyState = { count: 0 };
     expect(trackGitArchaeology(state, "bash", "git show abc123", 2)).toBe(false);
     expect(trackGitArchaeology(state, "bash", "git log -- bar.py", 2)).toBe(true);
+  });
+});
+
+describe("shouldIssueBudgetNudge", () => {
+  test("false before crossing the threshold fraction", () => {
+    expect(shouldIssueBudgetNudge(4 * 60_000, 10 * 60_000, false)).toBe(false);
+  });
+
+  test("true once elapsed time crosses the threshold fraction", () => {
+    expect(shouldIssueBudgetNudge(5 * 60_000, 10 * 60_000, false)).toBe(true);
+    expect(shouldIssueBudgetNudge(9 * 60_000, 10 * 60_000, false)).toBe(true);
+  });
+
+  test("false if already issued, even past the threshold", () => {
+    expect(shouldIssueBudgetNudge(9 * 60_000, 10 * 60_000, true)).toBe(false);
+  });
+
+  test("respects a custom threshold fraction", () => {
+    expect(shouldIssueBudgetNudge(2 * 60_000, 10 * 60_000, false, 0.25)).toBe(false);
+    expect(shouldIssueBudgetNudge(3 * 60_000, 10 * 60_000, false, 0.25)).toBe(true);
+  });
+
+  test("false for a zero or negative timeout", () => {
+    expect(shouldIssueBudgetNudge(1000, 0, false)).toBe(false);
   });
 });

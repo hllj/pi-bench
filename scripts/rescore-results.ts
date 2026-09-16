@@ -7,6 +7,7 @@ export interface BenchResult {
   judgeRationale?: string;
   sweContainerTest?: boolean;
   sweTestExitCode?: number | null;
+  excludeFromPassRate?: boolean;
   durationMs: number;
   [key: string]: unknown;
 }
@@ -41,11 +42,15 @@ export async function rescoreResultsDir(dirPath: string): Promise<RescoreSummary
   const rescoredFiles: { task: string; from: number; to: number }[] = [];
   let oldPassed = 0;
   let newPassed = 0;
+  // Harness-error tasks (malformed FAIL_TO_PASS -- no test could be run) are
+  // excluded from both pass rates' denominators, mirroring src/index.ts.
+  let harnessErrors = 0;
 
   for (const file of files) {
     const filePath = join(dirPath, file);
     const result: BenchResult = JSON.parse(await readFile(filePath, "utf-8"));
-    if (result.judgeScore === 1) oldPassed++;
+    if (result.excludeFromPassRate) harnessErrors++;
+    else if (result.judgeScore === 1) oldPassed++;
 
     const { judgeScore, rescored } = computeGroundTruthScore(result);
     if (rescored) {
@@ -55,8 +60,10 @@ export async function rescoreResultsDir(dirPath: string): Promise<RescoreSummary
       await writeFile(filePath, JSON.stringify(result, null, 2));
       rescoredFiles.push({ task: result.task, from: oldScore, to: judgeScore });
     }
-    if (judgeScore === 1) newPassed++;
+    if (!result.excludeFromPassRate && judgeScore === 1) newPassed++;
   }
+
+  const scorableFiles = files.length - harnessErrors;
 
   const summaryPath = join(dirPath, "summary.json");
   try {
@@ -67,7 +74,8 @@ export async function rescoreResultsDir(dirPath: string): Promise<RescoreSummary
         return { ...r, judgeScore };
       });
       summary.passedTasks = newPassed;
-      summary.passRate = files.length > 0 ? newPassed / files.length : 0;
+      summary.harnessErrorTasks = harnessErrors;
+      summary.passRate = scorableFiles > 0 ? newPassed / scorableFiles : 0;
       await writeFile(summaryPath, JSON.stringify(summary, null, 2));
     }
   } catch {
@@ -77,8 +85,8 @@ export async function rescoreResultsDir(dirPath: string): Promise<RescoreSummary
   return {
     totalFiles: files.length,
     rescoredFiles,
-    oldPassRate: files.length > 0 ? oldPassed / files.length : 0,
-    newPassRate: files.length > 0 ? newPassed / files.length : 0,
+    oldPassRate: scorableFiles > 0 ? oldPassed / scorableFiles : 0,
+    newPassRate: scorableFiles > 0 ? newPassed / scorableFiles : 0,
   };
 }
 

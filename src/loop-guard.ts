@@ -26,3 +26,19 @@ export function trackGitArchaeology(
   }
   return state.count >= threshold;
 }
+
+// Fires exactly once, when the agent crosses `thresholdFraction` of its time
+// budget, so it can be nudged to stop broad exploration and finish
+// implementing/verifying the fix (see plans/improvement-plan.md P0 item 6 --
+// previously the only time-based signal was a hard abort at 100%, too late
+// to recover any of the wasted time on slow failures like sphinx-doc__sphinx-9320,
+// 45 minutes with zero source edits).
+export function shouldIssueBudgetNudge(
+  elapsedMs: number,
+  timeoutMs: number,
+  alreadyIssued: boolean,
+  thresholdFraction = 0.5
+): boolean {
+  if (alreadyIssued || timeoutMs <= 0) return false;
+  return elapsedMs >= timeoutMs * thresholdFraction;
+}
