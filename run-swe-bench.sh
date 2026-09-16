@@ -254,9 +254,14 @@ if attempts:
         shutil.copy2(best_trans, final_trans)
 " "$RESULTS_DIR" "$TASK_ID" "$PASS_COUNT"
 
-  # Count passes/fails based on the final combined file
+  # Count passes/fails based on the final combined file. A harness error
+  # (malformed FAIL_TO_PASS data -- no test could be run) is neither a pass
+  # nor a model failure, so it's excluded from both counters here too.
   FINAL_SCORE=$(python3 -c "import json, sys; r=json.load(open(sys.argv[1], 'r')); print(r.get('judgeScore', 0))" "$RESULTS_DIR/results-${TASK_ID}.json" 2>/dev/null || echo "0")
-  if [ "$FINAL_SCORE" = "1" ]; then
+  IS_HARNESS_ERROR=$(python3 -c "import json, sys; r=json.load(open(sys.argv[1], 'r')); print('1' if r.get('excludeFromPassRate') else '0')" "$RESULTS_DIR/results-${TASK_ID}.json" 2>/dev/null || echo "0")
+  if [ "$IS_HARNESS_ERROR" = "1" ]; then
+    echo "[WARN] Task $TASK_ID excluded: harness-error (malformed FAIL_TO_PASS)"
+  elif [ "$FINAL_SCORE" = "1" ]; then
     PASSED=$((PASSED + 1))
   else
     FAILED=$((FAILED + 1))
@@ -295,20 +300,27 @@ if not result_files:
 
 results = []
 passed = 0
+harness_errors = 0
 total_duration = 0
 
 for f in result_files:
     with open(f) as fh:
         r = json.load(fh)
         results.append(r)
-        if r.get('judgeScore') == 1:
+        if r.get('excludeFromPassRate'):
+            harness_errors += 1
+        elif r.get('judgeScore') == 1:
             passed += 1
         total_duration += r.get('durationMs', 0)
 
+# Harness-error tasks (malformed FAIL_TO_PASS data -- no test could be run)
+# are excluded from the pass-rate denominator, not counted as fails.
+scorable = len(results) - harness_errors
 summary = {
     'totalTasks': len(results),
+    'harnessErrorTasks': harness_errors,
     'passedTasks': passed,
-    'passRate': passed / len(results) if results else 0,
+    'passRate': passed / scorable if scorable else 0,
     'totalDurationMs': total_duration,
     'averageDurationMs': total_duration / len(results) if results else 0,
     'results': results
@@ -318,7 +330,7 @@ summary_path = os.path.join(results_dir, 'summary.json')
 with open(summary_path, 'w') as fh:
     json.dump(summary, fh, indent=2)
 
-print(f'[INFO] Aggregate summary: {passed}/{len(results)} passed ({summary[\"passRate\"]*100:.1f}%)')
+print(f'[INFO] Aggregate summary: {passed}/{scorable} passed ({summary[\"passRate\"]*100:.1f}%)' + (f' [{harness_errors} excluded: harness-error]' if harness_errors else ''))
 print(f'[INFO] Summary saved to {summary_path}')
 " "$RESULTS_DIR"
 else

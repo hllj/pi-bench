@@ -4,7 +4,7 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,38 +13,80 @@ import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
 import { parseJudgeOutput } from "./judge";
 import { buildAgentPrompt, buildVerificationRetryPrompt } from "./prompts";
-import { trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
+import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
+import { extractDjangoTestModules, validateFailToPass } from "./task-validation";
+import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from "./config-guard";
+import { scrubGitHistoryToOrphanBaseline } from "./git-scrub";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
-// SWE-bench container test command builder
-function buildSweTestCommand(task: any): string {
+// Base test timeout, scaled up for tasks with many FAIL_TO_PASS entries: a
+// fixed 300s cap regardless of F2P count either kills a large django
+// multi-module run early or wastes 300s waiting on a single fast pytest node.
+const BASE_TEST_TIMEOUT_MS = 300_000;
+const PER_TEST_TIMEOUT_MS = 120_000;
+const MAX_TEST_TIMEOUT_MS = 1_200_000; // 20 min hard cap regardless of F2P count
+
+function scaledTestTimeoutMs(failToPassCount: number): number {
+  return Math.min(MAX_TEST_TIMEOUT_MS, Math.max(BASE_TEST_TIMEOUT_MS, failToPassCount * PER_TEST_TIMEOUT_MS));
+}
+
+type SweTestPlan =
+  | { kind: "shell"; command: string; timeoutMs: number }
+  | { kind: "execFile"; file: string; args: string[]; timeoutMs: number }
+  | { kind: "invalid"; reason: string };
+
+// SWE-bench container test command builder. Refuses to build a command at
+// all when FAIL_TO_PASS is malformed (see src/task-validation.ts) rather
+// than silently falling back to running the FULL test suite (django, empty
+// module list) or handing pytest a nonexistent node id (sphinx) -- both
+// observed on the verified-mini import (django__django-12209,
+// sphinx-doc__sphinx-8265; see plans/improvement-plan.md P0 items 1-2). The
+// caller must treat "invalid" as scoreSource: "harness-error", never run
+// anything, and exclude the task from pass-rate.
+function buildSweTestPlan(task: any): SweTestPlan {
   const python = "/opt/miniconda3/envs/testbed/bin/python";
+  const failToPass: string[] = task.failToPass || [];
+  const validation = validateFailToPass(task.repo, failToPass);
+  if (!validation.valid) {
+    return {
+      kind: "invalid",
+      reason: `malformed FAIL_TO_PASS entr${validation.invalidIds.length === 1 ? "y" : "ies"}: ${JSON.stringify(validation.invalidIds)}`,
+    };
+  }
+  const timeoutMs = scaledTestTimeoutMs(failToPass.length);
 
   if (task.repo === "django/django") {
-    // Extract test modules from FAIL_TO_PASS entries like
-    // "test_foo (auth_tests.test_forms.AuthTest)" → "auth_tests.test_forms"
-    const modules = [...new Set(task.failToPass.map((t: string) => {
-      const match = t.match(/\(([^)]+)\)/);
-      if (match) {
-        const parts = match[1].split(".");
-        return parts.slice(0, -1).join(".");
-      }
-      return t;
-    }))];
-    // Django's runtests.py returns exit 0 even on failures, so we wrap
-    // the command to parse the output and return a proper exit code.
-    return `${python} /testbed/tests/runtests.py ${modules.join(" ")} --verbosity 2 2>&1 | tee /tmp/test_output.txt; grep -q "^OK" /tmp/test_output.txt`;
+    const modules = extractDjangoTestModules(failToPass);
+    if (modules.length === 0) {
+      // Should be unreachable now that failToPass is validated above, but
+      // this is the exact condition that silently ran the full suite before
+      // -- keep the guard so a future validator gap fails loudly instead.
+      return { kind: "invalid", reason: "no test modules could be extracted from FAIL_TO_PASS" };
+    }
+    // Django's runtests.py returns exit 0 even on failures, so we wrap the
+    // command to parse the output and return a proper exit code. --failfast
+    // stops at the first failure instead of running every extracted module
+    // to completion.
+    return {
+      kind: "shell",
+      command: `${python} /testbed/tests/runtests.py ${modules.join(" ")} --verbosity 2 --failfast 2>&1 | tee /tmp/test_output.txt; grep -q "^OK" /tmp/test_output.txt`,
+      timeoutMs,
+    };
   }
 
   if (task.repo === "sphinx-doc/sphinx") {
-    // Sphinx uses pytest; FAIL_TO_PASS entries are pytest node IDs
-    const testPaths = task.failToPass.map((t: string) => `"${t}"`).join(" ");
-    return `cd /testbed && ${python} -m pytest ${testPaths} -xvs`;
+    // Sphinx uses pytest; FAIL_TO_PASS entries are pytest node IDs. Passed as
+    // an argv array (execFile, no shell) rather than interpolated into a
+    // shell string -- node ids can contain quotes, brackets, commas and
+    // parens (e.g. test_unparse[b'bytes'-b'bytes']) that a shell would
+    // otherwise need fragile escaping for. -x stops at the first failure.
+    return { kind: "execFile", file: python, args: ["-m", "pytest", ...failToPass, "-x", "-vs"], timeoutMs };
   }
 
   // Generic fallback: run pytest
-  return `cd /testbed && ${python} -m pytest --tb=short`;
+  return { kind: "shell", command: `cd /testbed && ${python} -m pytest --tb=short`, timeoutMs };
 }
 
 // Restores the repo's standard test directories to HEAD and drops any
@@ -96,13 +138,17 @@ async function revertAndApplySweTestPatch(tmpDir: string, testPatch: string): Pr
   await applySweTestPatch(tmpDir, testPatch);
 }
 
-async function runSweBenchTestCommand(tmpDir: string, task: any): Promise<{ testExitCode: number; testOutput: string }> {
-  const sweTestCmd = buildSweTestCommand(task);
-  console.log(`[INFO] SWE test command: ${sweTestCmd}`);
+async function runSweBenchTestCommand(tmpDir: string, task: any): Promise<{ testExitCode: number | null; testOutput: string; harnessError?: boolean }> {
+  const plan = buildSweTestPlan(task);
+  if (plan.kind === "invalid") {
+    console.error(`[ERROR] Refusing to run SWE-bench test -- ${plan.reason}`);
+    return { testExitCode: null, testOutput: `HARNESS_ERROR: ${plan.reason}`, harnessError: true };
+  }
+  console.log(`[INFO] SWE test command: ${plan.kind === "shell" ? plan.command : `${plan.file} ${plan.args.join(" ")}`}`);
   try {
-    const { stdout, stderr } = await execAsync(sweTestCmd, {
-      cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: 300_000
-    });
+    const { stdout, stderr } = plan.kind === "shell"
+      ? await execAsync(plan.command, { cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: plan.timeoutMs })
+      : await execFileAsync(plan.file, plan.args, { cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: plan.timeoutMs });
     console.log(`[INFO] SWE-bench test exit code: 0`);
     return { testExitCode: 0, testOutput: `STDOUT:\n${stdout}\nSTDERR:\n${stderr}` };
   } catch (error: any) {
@@ -128,16 +174,29 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
   try {
     if (isSweContainer) {
       console.log(`[INFO] Using pre-configured SWE-bench testbed at ${sweTestbed}`);
-      // Ensure git is initialized, then commit a clean baseline so pre-existing
-      // image noise (e.g. setup.py/tox.ini/CHANGES shipped dirty) is NOT
-      // attributed to the agent's diff. The agent's changes are then diffed
-      // against this baseline exactly.
-      try { await execAsync(`git status`, { cwd: tmpDir }); } catch {
-        await execAsync(`git init`, { cwd: tmpDir });
-      }
-      await execAsync(`git add -A`, { cwd: tmpDir });
-      await execAsync(`git -c user.email=bench@pi.local -c user.name="Pi Benchmarker" commit -m "benchmark-baseline" --allow-empty`, { cwd: tmpDir });
-      console.log(`[INFO] Baseline commit created (pre-existing image changes excluded from agent diff).`);
+      // Ensure git is initialized, then collapse to a single ORPHAN baseline
+      // commit. This does two things at once:
+      // (a) pre-existing image noise (e.g. setup.py/tox.ini/CHANGES shipped
+      //     dirty) is NOT attributed to the agent's diff -- the agent's
+      //     changes are diffed against this baseline exactly (same as the
+      //     old plain "benchmark-baseline" commit); and
+      // (b) SWE-bench images ship the FULL upstream repo history, including
+      //     commits/tags authored AFTER this task's base commit. An agent
+      //     that runs `git log`/`git show`/checks out a future tag can read
+      //     off the real upstream fix instead of solving the task (observed
+      //     on sphinx-doc__sphinx-9320 and sphinx-doc__sphinx-8548 --
+      //     45 minutes burned chasing tags v4.1.0..v8.1.3 with zero source
+      //     edits; see plans/improvement-plan.md cross-cutting finding #1).
+      //     An orphan commit has no parents, so `git log` can only ever show
+      //     this one commit -- and deleting every other ref/tag below drops
+      //     the loose future-commit objects entirely.
+      // Note: only the individual ref/tag/gc cleanup steps inside this call
+      // are best-effort (each swallows its own error) -- a failure to create
+      // the orphan branch or the baseline commit itself still throws here,
+      // aborting the task exactly as the old unwrapped git init/commit calls
+      // did, rather than silently proceeding with a dirty comparison base.
+      const { staleRefsDropped } = await scrubGitHistoryToOrphanBaseline(tmpDir);
+      console.log(`[INFO] Baseline commit created on an orphan branch (pre-existing image changes AND future git history/tags excluded, ${staleRefsDropped} stale ref(s) dropped).`);
     } else {
       console.log(`[INFO] Cloning ${task.repo} at commit ${task.commit}...`);
       await execAsync(`git init`, { cwd: tmpDir });
@@ -236,6 +295,29 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     let archaeologyNudgesUsed = 0;
     const maxArchaeologyNudges = 2;
 
+    // Config-file early-warning: catches the agent editing a build/env
+    // artifact (setup.py, tox.ini, ...) THE MOMENT it happens, rather than
+    // only at the very end via the diff-based check below (see
+    // plans/improvement-plan.md cross-cutting finding #2 -- by the time the
+    // end-of-run check fires, the time budget is already spent). One-shot:
+    // a single nudge per task, mirroring the archaeology-nudge budget.
+    let configFileWarningNeeded = false;
+    let configFileWarningIssued = false;
+    let lastTouchedConfigFile = "";
+
+    // Time-budget nudge: fires once at 50% of the time budget so the agent
+    // can be steered to stop broad exploration and finish up, instead of the
+    // only prior time-based signal being a hard abort at 100% (too late to
+    // recover any of the wasted time -- see plans/improvement-plan.md P0
+    // item 6 and sphinx-doc__sphinx-9320: 45 min, zero source edits).
+    // Declared here (before the timeout/start below are assigned) but only
+    // ever read inside the subscribe callback, which can't fire until
+    // session.prompt() runs further down -- by then both are set.
+    let budgetNudgeNeeded = false;
+    let budgetNudgeIssued = false;
+    const start = Date.now();
+    const timeoutMs = timeoutMin * 60 * 1000;
+
     session.subscribe((event) => {
       if (event.type === "message_update" && event.assistantMessageEvent) {
         if (event.assistantMessageEvent.type === "text_delta") {
@@ -268,6 +350,34 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
             session.abort();
           }
 
+          if (
+            isSweContainer &&
+            !loopDetected &&
+            !archaeologyNudgeNeeded &&
+            !configFileWarningNeeded &&
+            !configFileWarningIssued &&
+            (event.toolName === "edit" || event.toolName === "write")
+          ) {
+            const filePath = extractToolFilePath(event.args);
+            if (filePath && isConfigArtifactFile(filePath)) {
+              console.warn(`\n[WARN] Agent is editing a build/config artifact (${filePath}) inside the SWE container. Nudging it to revert and focus on source code.`);
+              lastTouchedConfigFile = filePath;
+              configFileWarningNeeded = true;
+              session.abort();
+            }
+          }
+
+          if (
+            !loopDetected &&
+            !archaeologyNudgeNeeded &&
+            !configFileWarningNeeded &&
+            shouldIssueBudgetNudge(Date.now() - start, timeoutMs, budgetNudgeIssued)
+          ) {
+            console.warn(`\n[WARN] 50% of the ${timeoutMin}-minute time budget used. Nudging agent to focus on finishing.`);
+            budgetNudgeNeeded = true;
+            session.abort();
+          }
+
           if (argsStr.length > 200) argsStr = argsStr.substring(0, 200) + "...";
         } catch (e) { }
         console.log(`\n[AGENT] Started using tool: ${event.toolName} with args: ${argsStr}`);
@@ -286,9 +396,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     });
 
     console.log(`\n--- Agent output ---`);
-    const start = Date.now();
     const agentPrompt = buildAgentPrompt({ tmpDir, isSweContainer, taskPrompt: task.prompt });
-    const timeoutMs = timeoutMin * 60 * 1000;
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error("AGENT_TIMEOUT")), timeoutMs);
     });
@@ -307,12 +415,35 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
           ]);
           if (loopDetected) throw new Error("LOOP_DETECTED");
           if (archaeologyNudgeNeeded) throw new Error("ARCHAEOLOGY_NUDGE");
+          if (configFileWarningNeeded) throw new Error("CONFIG_FILE_WARNING");
+          if (budgetNudgeNeeded) throw new Error("BUDGET_NUDGE");
           break; // Finished successfully
         } catch (err: any) {
           if (err.message === "AGENT_TIMEOUT") {
             console.error(`\n[ERROR] Agent execution timed out after ${timeoutMin} minutes. Aborting...`);
             await session.abort();
             timedOut = true;
+          } else if (budgetNudgeNeeded || err.message === "BUDGET_NUDGE") {
+            // Same ordering requirement as the other nudge branches: this also
+            // calls session.abort(), so it MUST be checked before the generic
+            // loop-detected fallback swallows it as a plain abort. One-shot:
+            // budgetNudgeIssued is never cleared, unlike the archaeology/
+            // config-file nudges' per-trigger reset.
+            budgetNudgeNeeded = false;
+            budgetNudgeIssued = true;
+            const elapsedMin = Math.round((Date.now() - start) / 60000);
+            console.log(`\n[INFO] Time-budget nudge (${elapsedMin}/${timeoutMin} min elapsed)... Prompting agent to focus on finishing.`);
+            currentPrompt = `SYSTEM WARNING: You have used over half of your allotted time (${elapsedMin} of ${timeoutMin} minutes). Stop broad exploration now. If you haven't implemented the source-code fix yet, do so immediately. Verify ONLY against the specific failing test(s) described in the task -- do not re-run the full suite or continue investigating tangents.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
+            maxLoops--;
+          } else if (configFileWarningNeeded || err.message === "CONFIG_FILE_WARNING") {
+            // Same ordering requirement as the archaeology branch below: this
+            // also calls session.abort(), so it MUST be checked before the
+            // generic loop-detected fallback swallows it as a plain abort.
+            configFileWarningNeeded = false;
+            configFileWarningIssued = true;
+            console.log(`\n[INFO] Config-file nudge... Prompting agent to revert ${lastTouchedConfigFile} and focus on source code.`);
+            currentPrompt = `SYSTEM WARNING: You just modified \`${lastTouchedConfigFile}\`, a build/configuration file. In this container, files like setup.py/setup.cfg/tox.ini/pyproject.toml/requirements.txt ship ALREADY MODIFIED as environment noise unrelated to the bug -- editing them almost never fixes the actual issue and is very likely a mistake. Revert that change and focus exclusively on the real Python source code that causes the bug described in the task.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
+            maxLoops--;
           } else if (archaeologyNudgeNeeded || err.message === "ARCHAEOLOGY_NUDGE") {
             // MUST be checked BEFORE the loop-detection branch: the archaeology
             // detector also calls session.abort(), and the loop branch's generic
@@ -399,43 +530,29 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       diff = await getDiff();
     }
 
-    // Check if diff only contains config/environment files (no actual source code edits).
-    // This catches a common failure pattern where the agent modifies setup.py/tox.ini
-    // (environment artifacts) but never edits real source code.
-    const CONFIG_ONLY_FILES = new Set([
-      "setup.py", "setup.cfg", "tox.ini", "pyproject.toml",
-      "requirements.txt", ".pre-commit-config.yaml", "Makefile",
-      "MANIFEST.in", "pytest.ini", ".flake8", ".pylintrc",
-    ]);
-
-    const diffHasOnlyConfigFiles = (diffText: string): boolean => {
-      if (!diffText.trim()) return false; // empty diff is handled separately
-      const files: string[] = [];
-      for (const line of diffText.split("\n")) {
-        if (line.startsWith("diff --git")) {
-          const parts = line.split(" ");
-          if (parts.length >= 4) {
-            const filePath = parts[3].replace(/^b\//, "");
-            files.push(filePath.split("/").pop() || filePath);
-          }
-        }
-      }
-      if (files.length === 0) return false;
-      return files.every((f) => CONFIG_ONLY_FILES.has(f));
-    };
+    // Check whether the diff touches config/environment artifact files (see
+    // src/config-guard.ts). Two shapes matter: "config-only" (no real source
+    // edits at all -- the original check) and "mixed" (config artifacts
+    // riding alongside a real fix -- previously invisible to the all-or-
+    // nothing check, see plans/improvement-plan.md cross-cutting finding #2).
+    const configDiffClass = classifyConfigDiff(diff);
 
     if (
-      diffHasOnlyConfigFiles(diff) &&
+      configDiffClass !== "none" &&
       !timedOut &&
       (!lastAssistant || lastAssistant.stopReason !== "error")
     ) {
-      console.log(
-        `\n[INFO] Agent only modified config/build files (no source code edits). Prompting to make actual changes...`
-      );
       const configOnlyPrompt = `IMPORTANT: You have only modified build/configuration files (such as setup.py, tox.ini, pyproject.toml) but have NOT made any actual source code changes. These config file changes are likely environment artifacts and do NOT address the issue.\n\nYou MUST edit the actual source code files to fix the bug described in the task. Go back to investigating the issue and implement the fix in the relevant Python source files.\n\nReminder of your task:\n${task.prompt}`;
+      const mixedDiffPrompt = `IMPORTANT: Alongside your source code fix, your diff also modifies build/configuration files (such as setup.py, tox.ini, pyproject.toml). These are very likely pre-existing environment artifacts in this container, not part of the actual fix.\n\nRevert ONLY the changes to those build/configuration files (keep your source code fix intact), then stop.`;
+
+      if (configDiffClass === "config-only") {
+        console.log(`\n[INFO] Agent only modified config/build files (no source code edits). Prompting to make actual changes...`);
+      } else {
+        console.log(`\n[INFO] Agent's diff mixes config/build files with real source changes. Prompting it to revert just the config files...`);
+      }
 
       try {
-        await runPromptWithLoopDetection(configOnlyPrompt);
+        await runPromptWithLoopDetection(configDiffClass === "config-only" ? configOnlyPrompt : mixedDiffPrompt);
       } catch (err: any) {
         if (err.message === "AGENT_TIMEOUT") {
           // handled
@@ -460,7 +577,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         }
       }
 
-      console.log(`[INFO] Re-extracting diff after config-only re-prompt...`);
+      console.log(`[INFO] Re-extracting diff after config-diff re-prompt...`);
       diff = await getDiff();
     }
 
@@ -472,6 +589,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     let testOutput = "";
     let testExitCode: number | null = null;
     let verificationRetries = 0;
+    let harnessError = false;
 
     // SWE-bench container test evaluation: apply test patch and run FAIL_TO_PASS tests
     if (isSweContainer && task.failToPass && task.failToPass.length > 0) {
@@ -488,13 +606,15 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       }
 
       // Run the test command appropriate for this repo
-      ({ testExitCode, testOutput } = await runSweBenchTestCommand(tmpDir, task));
+      ({ testExitCode, testOutput, harnessError = false } = await runSweBenchTestCommand(tmpDir, task));
 
       // One-shot verification retry: if the REAL acceptance tests failed, give
       // the agent exactly one more corrective pass with the actual failure
       // output (instead of only discovering it post-hoc via the judge), then
-      // re-run the tests once more before finalizing the result.
-      if (testExitCode !== 0 && !timedOut && (!lastAssistant || lastAssistant.stopReason !== "error")) {
+      // re-run the tests once more before finalizing the result. Skipped on a
+      // harness error (malformed FAIL_TO_PASS) -- there is no valid test to
+      // retry against, and re-running it would only reproduce the same error.
+      if (testExitCode !== 0 && !harnessError && !timedOut && (!lastAssistant || lastAssistant.stopReason !== "error")) {
         console.log(`\n[INFO] Fix failed the real acceptance tests. Giving the agent one corrective pass with the actual failure output...`);
         const retryPrompt = buildVerificationRetryPrompt(testOutput, task);
         // Fresh phase: a git-archaeology streak left over from the main prompt
@@ -547,7 +667,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         }
 
         console.log(`[INFO] Re-running SWE-bench FAIL_TO_PASS tests after retry...`);
-        ({ testExitCode, testOutput } = await runSweBenchTestCommand(tmpDir, task));
+        ({ testExitCode, testOutput, harnessError = false } = await runSweBenchTestCommand(tmpDir, task));
       }
     } else {
       // Original flow for non-SWE tasks
@@ -699,9 +819,16 @@ ${testResultsSection}
     // FAIL_TO_PASS test result DECIDES the score; the LLM judge only explains
     // (its raw verdict is recorded as judgeModelScore for later comparison).
     // For other tasks the judge decides; unparseable judge output defaults to 0.
-    let scoreSource: "container-test" | "judge" | "judge-parse-failed" = "judge";
+    // A harness error (malformed FAIL_TO_PASS -- see task-validation.ts) is
+    // checked FIRST: it also has testExitCode === null, but must never fall
+    // through to the judge, which never saw a real test result either.
+    let scoreSource: "container-test" | "judge" | "judge-parse-failed" | "harness-error" = "judge";
     let finalScore: number = 0;
-    if (isSweContainer && task.failToPass && task.failToPass.length > 0 && testExitCode !== null) {
+    if (isSweContainer && task.failToPass && task.failToPass.length > 0 && harnessError) {
+      scoreSource = "harness-error";
+      finalScore = 0;
+      console.log(`[INFO] Harness error -- malformed FAIL_TO_PASS data, no test could be run. Excluding ${task.id} from pass-rate.`);
+    } else if (isSweContainer && task.failToPass && task.failToPass.length > 0 && testExitCode !== null) {
       scoreSource = "container-test";
       finalScore = testExitCode === 0 ? 1 : 0;
       if (judgeScore !== null && judgeScore !== finalScore) {
@@ -725,12 +852,14 @@ ${testResultsSection}
       judgeModelScore: judgeScore,   // raw LLM judge verdict (null if unparseable)
       judgeParseFailed,
       judgeAttempts: judgeAttemptsUsed,
-      scoreSource,                   // "container-test" (SWE ground truth) | "judge" | "judge-parse-failed"
+      scoreSource,                   // "container-test" (SWE ground truth) | "judge" | "judge-parse-failed" | "harness-error"
+      excludeFromPassRate: scoreSource === "harness-error",
       judgeModel: judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
       timedOut,
       loopRecoveries,
       verificationRetries,
       archaeologyNudges: archaeologyNudgesUsed,
+      timeBudgetNudged: budgetNudgeIssued,
     };
     if (isSweContainer) {
       result.sweContainerTest = true;
@@ -926,6 +1055,7 @@ async function main() {
 
   const results = [];
   let passed = 0;
+  let harnessErrors = 0;
   let totalDuration = 0;
 
   for (const f of taskFiles) {
@@ -939,7 +1069,8 @@ async function main() {
         const res = JSON.parse(existing);
         console.log(`[INFO] Skipping ${task.id}, result already exists.`);
         results.push(res);
-        if (res.judgeScore === 1) passed++;
+        if (res.excludeFromPassRate) harnessErrors++;
+        else if (res.judgeScore === 1) passed++;
         totalDuration += res.durationMs;
         continue;
       } catch (e) {
@@ -951,16 +1082,22 @@ async function main() {
 
     const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools);
     results.push(res);
-    if (res.judgeScore === 1) passed++;
+    if (res.excludeFromPassRate) harnessErrors++;
+    else if (res.judgeScore === 1) passed++;
     totalDuration += res.durationMs;
   }
 
+  // Tasks with a harness error (malformed FAIL_TO_PASS data -- no test could
+  // be run) are excluded from the pass-rate denominator entirely rather than
+  // counted as fails: they say nothing about the agent's fix quality.
+  const scorableTasks = results.length - harnessErrors;
   const summary = {
     totalTasks: results.length,
+    harnessErrorTasks: harnessErrors,
     passedTasks: passed,
-    passRate: passed / results.length,
+    passRate: scorableTasks > 0 ? passed / scorableTasks : 0,
     totalDurationMs: totalDuration,
-    averageDurationMs: totalDuration / results.length,
+    averageDurationMs: results.length > 0 ? totalDuration / results.length : 0,
     results
   };
 
@@ -968,7 +1105,7 @@ async function main() {
   await writeFile(summaryPath, JSON.stringify(summary, null, 2));
   console.log(`\n======================================================`);
   console.log(`[INFO] Benchmark Suite Complete!`);
-  console.log(`[INFO] Pass Rate: ${(summary.passRate * 100).toFixed(2)}% (${passed}/${results.length})`);
+  console.log(`[INFO] Pass Rate: ${(summary.passRate * 100).toFixed(2)}% (${passed}/${scorableTasks})${harnessErrors > 0 ? ` [${harnessErrors} excluded: harness-error]` : ""}`);
   console.log(`[INFO] Summary saved to ${summaryPath}`);
   console.log(`======================================================\n`);
 }
