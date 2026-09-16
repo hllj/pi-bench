@@ -16,6 +16,7 @@ import { buildAgentPrompt, buildVerificationRetryPrompt } from "./prompts";
 import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
 import { extractDjangoTestModules, validateFailToPass } from "./task-validation";
 import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from "./config-guard";
+import { scrubGitHistoryToOrphanBaseline } from "./git-scrub";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -189,26 +190,13 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       //     An orphan commit has no parents, so `git log` can only ever show
       //     this one commit -- and deleting every other ref/tag below drops
       //     the loose future-commit objects entirely.
-      try { await execAsync(`git status`, { cwd: tmpDir }); } catch {
-        await execAsync(`git init`, { cwd: tmpDir });
-      }
-      const baselineBranch = "pi-bench-baseline";
-      await execAsync(`git branch -D ${baselineBranch}`, { cwd: tmpDir }).catch(() => {});
-      await execAsync(`git checkout --orphan ${baselineBranch}`, { cwd: tmpDir });
-      await execAsync(`git add -A`, { cwd: tmpDir });
-      await execAsync(`git -c user.email=bench@pi.local -c user.name="Pi Benchmarker" commit -m "benchmark-baseline" --allow-empty`, { cwd: tmpDir });
-      try {
-        const { stdout: refsOut } = await execAsync(`git for-each-ref --format=%(refname)`, { cwd: tmpDir });
-        const staleRefs = refsOut.split("\n").map((r) => r.trim()).filter((r) => r && r !== `refs/heads/${baselineBranch}`);
-        for (const ref of staleRefs) {
-          await execAsync(`git update-ref -d ${ref}`, { cwd: tmpDir }).catch(() => {});
-        }
-        await execAsync(`git reflog expire --expire=now --all`, { cwd: tmpDir }).catch(() => {});
-        await execAsync(`git gc --prune=now`, { cwd: tmpDir }).catch(() => {});
-        console.log(`[INFO] Baseline commit created on an orphan branch (pre-existing image changes AND future git history/tags excluded, ${staleRefs.length} stale ref(s) dropped).`);
-      } catch (e) {
-        console.warn(`[WARN] Baseline commit created, but failed to fully scrub stale refs/tags (agent may still see future git history):`, e);
-      }
+      // Note: only the individual ref/tag/gc cleanup steps inside this call
+      // are best-effort (each swallows its own error) -- a failure to create
+      // the orphan branch or the baseline commit itself still throws here,
+      // aborting the task exactly as the old unwrapped git init/commit calls
+      // did, rather than silently proceeding with a dirty comparison base.
+      const { staleRefsDropped } = await scrubGitHistoryToOrphanBaseline(tmpDir);
+      console.log(`[INFO] Baseline commit created on an orphan branch (pre-existing image changes AND future git history/tags excluded, ${staleRefsDropped} stale ref(s) dropped).`);
     } else {
       console.log(`[INFO] Cloning ${task.repo} at commit ${task.commit}...`);
       await execAsync(`git init`, { cwd: tmpDir });
