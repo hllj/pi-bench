@@ -213,7 +213,6 @@ bun run src/index.ts tasks/curated/easy.json
 | `--timeout <minutes>` | Agent timeout per task | `30` |
 | `--pass <N>` | Number of attempts to make per task (retries on failure) | `1` |
 | `--exclude-tools <list\|none>` | Comma-separated tool names to disable, or `none` to allow everything | `web_search,web_fetch,question,questionnaire` |
-| `--prompt-template <name>` | Send each task as `/<name> <task prompt>` so pi expands that prompt template (from `~/.pi/agent/prompts`) instead of receiving the task as plain text — e.g. `implement` or `scout-and-plan` to drive the `subagent` scout/planner/worker chain. Fails fast if the template isn't loaded. Recorded in the run metadata | *(off — plain prompt)* |
 
 `--exclude-tools` defaults to disabling `web_search` and `web_fetch` (if your `~/.pi/agent` extensions register them) so the agent can't look up the real upstream fix online instead of solving the task, and `question`/`questionnaire` since no human is ever attached to a benchmark run — they fail cleanly rather than hang, but there's no reason to let a task burn a turn reaching for one — pass `--exclude-tools none` to allow all tools, or your own comma-separated list to disable a different set.
 

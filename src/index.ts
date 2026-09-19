@@ -15,7 +15,7 @@ import { existsSync } from "node:fs";
 import { findDanglingSymlinks, formatResourceSummary } from "./agent-config";
 import { extractAgentDiff } from "./diff";
 import { parseJudgeOutput } from "./judge";
-import { assertValidTemplateName, buildAgentPrompt, buildTemplateInvocation, buildVerificationRetryPrompt } from "./prompts";
+import { buildAgentPrompt, buildVerificationRetryPrompt } from "./prompts";
 import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
 import { extractDjangoTestModules, validateFailToPass } from "./task-validation";
 import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from "./config-guard";
@@ -161,7 +161,7 @@ async function runSweBenchTestCommand(tmpDir: string, task: any): Promise<{ test
   }
 }
 
-async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[], promptTemplate?: string) {
+async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[]) {
   const taskContent = await readFile(taskFile, "utf-8");
   const task = JSON.parse(taskContent);
 
@@ -417,19 +417,6 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
 
     console.log(`\n--- Agent output ---`);
     const agentPrompt = buildAgentPrompt({ tmpDir, isSweContainer, taskPrompt: task.prompt });
-    // --prompt-template: send "/<name> <agentPrompt>" so pi expands the named
-    // prompt template (e.g. /implement -> a subagent scout/planner/worker chain)
-    // instead of the model receiving the task as plain text. A name that isn't
-    // loaded would otherwise be sent literally as text and silently do nothing.
-    let initialPrompt = agentPrompt;
-    if (promptTemplate) {
-      const available = session.promptTemplates.map((t) => t.name);
-      if (!available.includes(promptTemplate)) {
-        throw new Error(`Prompt template "${promptTemplate}" is not loaded. Available: ${available.join(", ") || "(none)"}`);
-      }
-      initialPrompt = buildTemplateInvocation(promptTemplate, agentPrompt);
-      console.log(`[INFO] Invoking prompt template /${promptTemplate} with the task prompt as its argument.`);
-    }
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error("AGENT_TIMEOUT")), timeoutMs);
     });
@@ -512,7 +499,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       }
     };
 
-    await runPromptWithLoopDetection(initialPrompt);
+    await runPromptWithLoopDetection(agentPrompt);
 
     let lastAssistant = [...session.messages].reverse().find(m => m.role === "assistant") as any;
     if (lastAssistant && lastAssistant.stopReason === "error") {
@@ -935,7 +922,6 @@ async function main() {
       "inference-profile": { type: "string" },
       "print-output-dir": { type: "boolean" },
       "exclude-tools": { type: "string" },
-      "prompt-template": { type: "string" },
     },
     allowPositionals: true,
   });
@@ -965,20 +951,12 @@ async function main() {
     console.error(`[INFO] Excluding tools: ${excludeTools.join(", ")}`);
   }
 
-  // Optional: drive every task through a pi prompt template (see runTask).
-  // Validate the name now so a typo fails once, up front, not once per task.
-  const promptTemplate = (values["prompt-template"] as string | undefined)?.replace(/^\//, "");
-  if (promptTemplate !== undefined) {
-    assertValidTemplateName(promptTemplate);
-    if (!values["print-output-dir"]) console.error(`[INFO] Prompt template: /${promptTemplate}`);
-  }
-
   // --provider takes precedence, --engine is a backward-compat alias
   const provider = (values.provider || values.engine || "llama.cpp") as string;
 
   const targetPath = positionals[0];
   if (!targetPath && !values["print-output-dir"]) {
-    console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params] [--exclude-tools web_search,web_fetch|none] [--prompt-template implement|scout-and-plan|...]");
+    console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params] [--exclude-tools web_search,web_fetch|none]");
     process.exit(1);
   }
 
@@ -1078,7 +1056,6 @@ async function main() {
     judgeModel: judgeModelReq ? `${judgeModelReq.provider}/${judgeModelReq.id}` : "default (same as agent)",
     timeoutMin,
     excludeTools: excludeTools.length > 0 ? excludeTools : undefined,
-    promptTemplate: promptTemplate,
   };
   if (values["inference-profile"]) {
     runMeta.inferenceProfile = values["inference-profile"];
@@ -1116,7 +1093,7 @@ async function main() {
       console.warn(`[WARN] Could not pre-parse task file ${f} for resume check.`);
     }
 
-    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools, promptTemplate);
+    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools);
     results.push(res);
     if (res.excludeFromPassRate) harnessErrors++;
     else if (res.judgeScore === 1) passed++;

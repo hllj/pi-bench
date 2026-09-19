@@ -33,33 +33,6 @@ Issue Description:
 ${taskPrompt}`;
 }
 
-// Wraps `text` so pi's slash-command tokenizer (parseCommandArgs) reads it back
-// as ONE argument, byte-for-byte. That tokenizer is bash-like but has no escape
-// character: whitespace inside a quoted run is kept (so newlines survive), and
-// adjacent quoted runs concatenate into one argument. So split on `"`, wrap
-// each piece in double quotes, and emit each literal `"` as `'"'`.
-function quoteTemplateArg(text: string): string {
-  return text
-    .split('"')
-    .map((piece) => (piece === "" ? "" : `"${piece}"`))
-    .join(`'"'`);
-}
-
-// Builds the "/name <task>" string that session.prompt() expands via the
-// prompt template of that name (e.g. ~/.pi/agent/prompts/implement.md, whose
-// $@ receives `text`). Without this a benchmark run sends the task as plain
-// text and no prompt template -- hence no subagent chain -- is ever triggered.
-export function assertValidTemplateName(templateName: string): void {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(templateName)) {
-    throw new Error(`Invalid prompt template name "${templateName}" (expected e.g. "implement" or "scout-and-plan")`);
-  }
-}
-
-export function buildTemplateInvocation(templateName: string, text: string): string {
-  assertValidTemplateName(templateName);
-  return `/${templateName} ${quoteTemplateArg(text)}`;
-}
-
 // Feeds the REAL FAIL_TO_PASS test failure back to the agent for one more
 // correction pass, instead of only discovering it post-hoc via the judge.
 // Targets the dominant genuine-failure pattern: the agent runs a narrow,

@@ -1,9 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildAgentPrompt, buildSweEnvInstruction, buildTemplateInvocation, buildVerificationRetryPrompt } from "./prompts";
-// The SDK's own template expander is the oracle: it is exactly what
-// session.prompt() runs on a "/name args" string. Not in the package's public
-// exports map, hence the relative path.
-import { expandPromptTemplate } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/prompt-templates.js";
+import { buildAgentPrompt, buildSweEnvInstruction, buildVerificationRetryPrompt } from "./prompts";
 
 describe("buildSweEnvInstruction", () => {
   test("returns empty string when not running in an SWE container", () => {
@@ -63,36 +59,5 @@ describe("buildVerificationRetryPrompt", () => {
     const hugeOutput = "x".repeat(10000);
     const prompt = buildVerificationRetryPrompt(hugeOutput, { failToPass: ["test_foo"] });
     expect(prompt.length).toBeLessThan(6000);
-  });
-});
-
-describe("buildTemplateInvocation", () => {
-  // Mirrors ~/pi-config/subagent/prompts/*.md: the task text lands wherever $@ is.
-  const templates = [{ name: "implement", description: "d", content: "Do this: $@ (end)", filePath: "/x", sourceInfo: {} }] as any;
-  const expand = (text: string) => expandPromptTemplate(buildTemplateInvocation("implement", text), templates);
-
-  test("prefixes the template name so pi expands it as a slash command", () => {
-    expect(buildTemplateInvocation("implement", "fix it").startsWith("/implement ")).toBe(true);
-  });
-
-  test("delivers a plain single-line task through $@ unchanged", () => {
-    expect(expand("fix the typo")).toBe("Do this: fix the typo (end)");
-  });
-
-  test("survives newlines, both quote types and backticks -- real task prompts contain all of them", () => {
-    const task = "You are an expert.\n\nCRITICAL:\n1. Don't use \"clone\" -- it's already here.\n2. Fix `res.json(undefined)` in 'lib/response.js'.\n\nIssue: it says \"foo\" and 'bar'.";
-    expect(expand(task)).toBe(`Do this: ${task} (end)`);
-  });
-
-  test("survives a task made only of quote characters, a leading slash, or edge whitespace", () => {
-    for (const task of [`"`, `'`, `""'"'`, `/etc/passwd "x"`, `  leading and trailing  `]) {
-      expect(expand(task)).toBe(`Do this: ${task} (end)`);
-    }
-  });
-
-  test("rejects template names that could not be a single slash-command token", () => {
-    for (const bad of ["", "has space", "../x", "a/b", "-x;rm"]) {
-      expect(() => buildTemplateInvocation(bad, "t")).toThrow(/template name/i);
-    }
   });
 });
