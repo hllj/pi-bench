@@ -1,5 +1,6 @@
 import {
   createAgentSession,
+  getAgentDir,
   ModelRegistry,
   ModelRuntime,
   SessionManager,
@@ -11,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
+import { findDanglingSymlinks, formatResourceSummary } from "./agent-config";
 import { parseJudgeOutput } from "./judge";
 import { buildAgentPrompt, buildVerificationRetryPrompt } from "./prompts";
 import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
@@ -283,6 +285,23 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     session.setActiveToolsByName(session.getAllTools().map((t) => t.name));
 
     console.log(`[INFO] Agent resolved to model: ${session.model?.provider}/${session.model?.id}`);
+
+    // Log what pi actually loaded. A skill/prompt symlink that dangles in the
+    // container is dropped by pi's resource loader without any diagnostic, so
+    // without this a run with zero skills/prompts looks identical to a healthy
+    // one (see src/agent-config.ts).
+    const resources = session.resourceLoader;
+    console.log(`[INFO] Loaded pi resources:\n${formatResourceSummary({
+      context: resources.getAgentsFiles().agentsFiles.map((f) => f.path),
+      skills: resources.getSkills().skills.map((s) => s.name),
+      prompts: resources.getPrompts().prompts.map((p) => p.name),
+      extensions: resources.getExtensions().extensions.map((e) => e.path),
+      excludedTools: excludeTools ?? [],
+    })}`);
+    const danglingLinks = findDanglingSymlinks(getAgentDir());
+    if (danglingLinks.length > 0) {
+      console.warn(`[WARN] ${danglingLinks.length} dangling symlink(s) under ${getAgentDir()} -- these skills/prompts/agents/extensions are NOT loaded (bind-mount their targets at the same path):\n  ${danglingLinks.join("\n  ")}`);
+    }
 
     let lastToolName = "";
     let lastToolArgs = "";

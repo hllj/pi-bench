@@ -17,25 +17,12 @@ docker build -t pi-bench-runner .
 # sources (e.g. "npm:pi-lens"), and createAgentSession() tries to
 # `npm install` any that aren't already present -- these containers don't
 # have npm on PATH, so without this mount that install crashes the run.
-AGENT_DIR="$HOME/.pi/agent"
-RESOURCE_MOUNTS=""
-for name in extensions skills prompts agents settings.json AGENTS.md npm; do
-    if [ -e "$AGENT_DIR/$name" ]; then
-        RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $AGENT_DIR/$name:/root/.pi/agent/$name:ro"
-    fi
-done
-
-# ~/.pi/agent/extensions is commonly a symlink into a separate config repo
-# (e.g. ~/pi-config). A bind mount doesn't rewrite symlink targets, so mount
-# the real target at its identical absolute path too, or the symlink dangles
-# inside the container.
-EXTENSIONS_MOUNT=""
-if [ -L "$AGENT_DIR/extensions" ]; then
-    REAL_EXT_DIR="$(cd -P "$AGENT_DIR/extensions" 2>/dev/null && pwd)"
-    if [ -n "$REAL_EXT_DIR" ] && [ "$REAL_EXT_DIR" != "$AGENT_DIR/extensions" ]; then
-        EXTENSIONS_MOUNT="-v $REAL_EXT_DIR:$REAL_EXT_DIR:ro"
-    fi
-fi
+# Builds RESOURCE_MOUNTS: each ~/.pi/agent resource read-only, plus every
+# symlink target (skills/prompts/agents/extensions are usually absolute
+# symlinks into a separate config repo) at its identical host path so the
+# links resolve in the container. See scripts/agent-mounts.sh for the why.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/agent-mounts.sh"
+build_agent_mounts "$HOME/.pi/agent"
 
 # Run the benchmark
 # -v $(pwd):/pi-bench:z mounts the pi-bench directory
@@ -49,7 +36,6 @@ fi
 docker run --init --rm -it --network host $ENV_ARGS \
     -v "$(pwd):/pi-bench:z" \
     $RESOURCE_MOUNTS \
-    $EXTENSIONS_MOUNT \
     -w /pi-bench \
     pi-bench-runner \
     bun run src/index.ts "$@"
