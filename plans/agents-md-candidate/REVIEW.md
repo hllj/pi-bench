@@ -1,16 +1,21 @@
 # Candidate `AGENTS.md` — review notes
 
-**Status: candidate for your review. `~/.pi/agent/AGENTS.md` has NOT been modified.**
-Files in this directory:
+> **Update 2026-09-20:** this document describes candidate **v1** (reviewed when `~/.pi/agent/AGENTS.md` was still
+> untouched). A later **v2** (v1 + the checkpoint-&-fork idea from your 14 Sep artifact + loophole fixes) was tested on
+> 36 sessions and **installed** into `~/.pi/agent/AGENTS.md`. See **`V2-RESULTS.md`** for what is live now, the
+> results, the risks and the one-line revert. The v1 rationale below still applies to the edits v2 inherits.
+
+**Status of v1: superseded by v2.** Files in this directory:
 
 | File | What |
 | --- | --- |
-| `AGENTS.candidate.md` | the full candidate (drop-in replacement) |
-| `AGENTS.candidate.diff` | unified diff against your current file (`+39 −15`, 250 → 274 lines) |
-| `REVIEW.md` | this document |
-
-To try it: `cp plans/agents-md-candidate/AGENTS.candidate.md ~/.pi/agent/AGENTS.md`
-(keep a backup — your file says not to edit `~/.pi/agent/` files casually, so this was left to you).
+| `AGENTS.v2.md` | **the version now installed** (`~/.pi/agent/AGENTS.md` is byte-identical to it) |
+| `AGENTS.original-2026-09-20.md` | your file before the update — revert target |
+| `AGENTS.candidate.md` | v1 (superseded) |
+| `AGENTS.candidate.diff` / `AGENTS.v2.diff` / `AGENTS.v1-to-v2.diff` | diffs: v1 vs original, v2 vs original, v2 vs v1 |
+| `V2-RESULTS.md` | v2: idea mapping, 36-session test matrix, findings, risks |
+| `REVIEW.md` | this document (v1 rationale + first 3-run test) |
+| `behavior-tests/` | the reusable skill/subagent case suite (9 cases) |
 
 ## Why change anything — what the experiments showed
 

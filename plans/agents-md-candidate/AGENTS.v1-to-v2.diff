@@ -1,0 +1,41 @@
+--- AGENTS.candidate.md (v1)
++++ AGENTS.v2.md
+@@ -10,12 +10,16 @@
+ 
+ 1. **Skill scan.** Compare the task with the skill list in your context. `read` the `SKILL.md` of every skill
+-   whose description matches (`dev-workflows` matches any bug fix, feature, refactor or codebase exploration).
+-   Skills live under `~/.pi/agent/`, outside your working directory — reading them is always allowed.
+-   Then record it: `note` (section `workflow`) → `Skills considered: <names read, or "none matched">`.
+-2. **Delegation check.** Dispatch a subagent instead of working inline when **any** of these holds:
++   whose description matches (`dev-workflows` matches any bug fix, feature, refactor or codebase exploration;
++   `pi-lens-ast-grep` matches searching or renaming code patterns; `subagents` matches any request to delegate).
++   A skill only counts if you actually `read` its `SKILL.md` — naming it is not enough. Skills live under
++   `~/.pi/agent/`, outside your working directory — reading them is always allowed.
++   Then, before your first edit, record it: `note` (section `workflow`) → `Skills read: <names, or "none matched">`.
++2. **Delegation check.** Dispatch a subagent (the `subagent` tool, or `run_dev_workflow`) instead of working inline
++   when **any** of these holds:
+    - you do not already know which files to change → `scout` first (or `run_dev_workflow` type `explore`);
+    - you expect to touch more than one source file, or a bug's cause is still unclear after ~6 tool calls →
+      `run_dev_workflow` (`bugfix` for a bug, `swat` for a feature);
+-   - you are about to declare done after editing source code → `reviewer` on your diff (Definition of done).
++   - you are about to declare done after editing source code → `reviewer` on your diff (Definition of done);
++   - the same problem has failed verification twice → checkpoint & fork (next section).
+ 3. **Inline is allowed only when none of those hold.** Say which triggers you checked in the same `note`.
+ 
+@@ -27,4 +31,16 @@
+ **Subagents:** if your first message begins with `Task:` you are a subagent — do step 1 only and never dispatch
+ further subagents.
++
++## When a fix keeps failing (checkpoint & fork)
++
++After **2 consecutive failed verifications of the same problem** (same test or error), stop iterating in place —
++your context now carries dead ends and stale assumptions.
++
++1. **Checkpoint.** `note` (sections `errors` / `learnings` / `worklog`): the problem, each approach tried and *why it
++   failed*, ranked hypotheses, and the current diff/state.
++2. **Fork.** Dispatch a fresh subagent (`subagent` tool: `planner` if a new approach needs designing, otherwise
++   `worker` or `general`) with **only** the checkpoint and the repro steps — not the conversation.
++3. **Merge or escalate.** If the fork verifies, take its result. If it also fails, record it with `learn`, then ask
++   the user (`question`) if one is attached; otherwise stop and report what you know instead of a third blind attempt.
+ 
+ ## How this file works (read before editing it)
