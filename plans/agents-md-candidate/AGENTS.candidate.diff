@@ -1,0 +1,101 @@
+--- AGENTS.md (current)
++++ AGENTS.candidate.md
+@@ -4,4 +4,27 @@
+ manual: who you are, how you work, and the rules that keep every session consistent.
+ Use every tool you have before falling back to a workaround.
++
++## Start-of-task protocol (every task, including small ones)
++
++Do this **before your first edit**. It is cheap, and skipping it is the failure this section exists to prevent.
++
++1. **Skill scan.** Compare the task with the skill list in your context. `read` the `SKILL.md` of every skill
++   whose description matches (`dev-workflows` matches any bug fix, feature, refactor or codebase exploration).
++   Skills live under `~/.pi/agent/`, outside your working directory — reading them is always allowed.
++   Then record it: `note` (section `workflow`) → `Skills considered: <names read, or "none matched">`.
++2. **Delegation check.** Dispatch a subagent instead of working inline when **any** of these holds:
++   - you do not already know which files to change → `scout` first (or `run_dev_workflow` type `explore`);
++   - you expect to touch more than one source file, or a bug's cause is still unclear after ~6 tool calls →
++     `run_dev_workflow` (`bugfix` for a bug, `swat` for a feature);
++   - you are about to declare done after editing source code → `reviewer` on your diff (Definition of done).
++3. **Inline is allowed only when none of those hold.** Say which triggers you checked in the same `note`.
++
++Task wording such as "autonomous", "no human interaction" or "minimal changes" does **not** waive this — it means
++*don't ask the user questions* and *keep the diff small*. A harness warning to "stop investigating" means stop
++investigating **yourself**: dispatching a `scout` is the sanctioned way to keep going. An explicit instruction not
++to delegate (e.g. "don't use subagents") still wins.
++
++**Subagents:** if your first message begins with `Task:` you are a subagent — do step 1 only and never dispatch
++further subagents.
+ 
+ ## How this file works (read before editing it)
+@@ -36,5 +59,5 @@
+ 
+ - **Answer the question first** before editing or running commands.
+-- Work **in small, verified increments** (`lsp_diagnostics`, `lens_diagnostics`) to catch
++- Work **in small, verified increments** (`lens_diagnostics`) to catch
+   errors before you declare work done.
+ - **TDD by default** for any testable change: RED → GREEN → VERIFY → REFACTOR.
+@@ -56,9 +79,9 @@
+ | Stage | What actually happens | Mechanism / gate |
+ | --- | --- | --- |
+-| **plan** | Before anything else, scan the in-context skill list for a name/description match to the task — a match is not a guarantee it'll be used, so explicitly `read` its `SKILL.md` (or run `/skill:<name>`) when one fits; don't assume it happens automatically. Then state success criteria + a brief step→verify plan; for bigger work use `/plan` or scout→planner (`run_dev_workflow`). | `planner`, `plan-mode`, `expect` contracts, skill-list scan |
++| **plan** | Run the **Start-of-task protocol** above (skill scan → `note` → delegation check). Then state success criteria + a brief step→verify plan; for bigger work use `/plan` or scout→planner (`run_dev_workflow`). | `planner`, `plan-mode`, `expect` contracts, skill-list scan |
+ | **test** | RED first for any testable change: drive a failing test (`run_test` with `expectFail`), then make it green. | `run_test`, `todo` |
+ | **implement** | Small verified increments; `worker`/`general` for isolated bodies; `swat`/`bugfix`/`refactor` pipelines for whole features. | `worker`, `subagent`, `run_dev_workflow` |
+-| **review** | Before declaring done, re-read your own diff from a fresh lens — a `reviewer` agent for non-trivial work — and confirm every changed line traces to the request. | `reviewer`, `git diff`/`git status` |
+-| **verify** | Diagnostics + tests on every changed file before done: `lsp_diagnostics` (+ `lens_diagnostics` for dead-code/deps/security), targeted `run_test`, then the relevant suite. pi-config itself → `npm run check`. | `lsp_diagnostics`, `lens_diagnostics`, `run_test`, `npm run check` |
++| **review** | Before declaring done, re-read your own diff from a fresh lens — for any source-code change dispatch a `reviewer` agent on it (docs-only: re-read it yourself) — and confirm every changed line traces to the request. | `reviewer`, `git diff`/`git status` |
++| **verify** | Diagnostics + tests on every changed file before done: `lens_diagnostics` (LSP + dead-code/deps/security), targeted `run_test`, then the relevant suite. pi-config itself → `npm run check`. | `lens_diagnostics`, `run_test`, `npm run check` |
+ | **remember** | Log results / learnings / errors to this session's notes (`note`) as you go — notes auto-seed on resume and record session boundaries. | `note`, `session-memory` |
+ | **improve** | Close the loop on failures: a recurring pattern → `learn`/`/learn` → mark/forget or promote to `skills/<name>/SKILL.md` so the fix is installed, not re-derived. | `learn`, `/learn` |
+@@ -66,5 +89,5 @@
+ Rules:
+ 
+-- **Trivial tasks** (single-shot, no behavior change, no test queue) may compress the loop — but never skip **verify**.
++- **Trivial tasks** (single-shot, no behavior change, no test queue) may compress the loop — but never skip **verify** or the **Start-of-task protocol**.
+ - **Multi-step or cross-cutting work** must not skip **plan**, **review**, or **remember**.
+ - Never report a task done without a **verify** signal in the transcript (see Definition of done).
+@@ -74,5 +97,5 @@
+ ## Behavioral guidelines
+ 
+-These bias toward caution over speed; for trivial tasks use judgment.
++These bias toward caution over speed; for trivial tasks use judgment (the Start-of-task protocol still applies).
+ 
+ **1. Think before coding.** Don't assume, don't hide confusion, surface tradeoffs.
+@@ -134,7 +157,8 @@
+   always `git diff` to review the result. Keep `edit`/`write` for single-file surgical
+   changes where the read-before-edit guard helps.
+-- **Lean loop over scaffolding.** If one `bash` command (or a small loop) does the job, use
+-  it instead of a chain of `subagent`/`ast_grep` calls — fewer tool hops = fewer selection
+-  errors. The heavy extensions exist for when they're needed, not as the default path.
++- **Lean loop for tool choice.** If one `bash` command (or a small loop) does the job, use it
++  instead of a chain of `ast_grep`/`symbol_search` calls — fewer tool hops = fewer selection
++  errors. This is about picking tools, not about delegating: the Start-of-task protocol's
++  triggers decide when a `subagent` / `run_dev_workflow` is required.
+ 
+ ### Tool groups (when to reach for each)
+@@ -143,6 +167,5 @@
+ | --- | --- | --- |
+ | `web_search` / `web_fetch` | current events, facts since training, or reading a page | DuckDuckGo + reader-mode extraction |
+-| `lsp_diagnostics` | pre-build error/warning check on file/dir (proactive) | primary first-line check |
+-| `lens_diagnostics` | aggregated LSP + lint + dead-code + security/CVE before done | `mode=all` for edited-file sweep |
++| `lens_diagnostics` | LSP + lint + dead-code + security/CVE on a file/dir — proactive first-line check, and before done | `mode=all` for edited-file sweep |
+ | `symbol_search` | ranked identifier search — find candidate files | first step of discovery funnel |
+ | `project_report` / `module_report` / `read_symbol` / `read_enclosing` | orient before editing: outline a file, read one symbol's body | cheaper than full `read` |
+@@ -181,11 +204,12 @@
+ **Definition of done** — a task is finished when all of these hold:
+ 
+-- **Verify (never skippable):** diagnostics clean on every changed file (`lsp_diagnostics`,
+-  plus `lens_diagnostics` for dead-code/dep/security) and the relevant suite passes
++- **Verify (never skippable):** diagnostics clean on every changed file (`lens_diagnostics`:
++  LSP + dead-code/dep/security) and the relevant suite passes
+   (pi-config itself → `npm run check`). The `verify-guard` extension nudges once at turn end
+   if you edited files but verified nothing (off until you enable it — persisted toggle
+   `/verify-guard`; advisory, never blocks).
+-- **Review (multi-step or risky work):** you re-read your own diff from a fresh context (or
+-  dispatched a `reviewer` agent), and every changed line traces to the request. `/watchdog`
++- **Review (any source-code change):** a `reviewer` agent was dispatched on your diff and its
++  verdict is in the transcript (`BLOCK` findings fixed) — docs-only: re-read your own diff from
++  a fresh context. Every changed line traces to the request. `/watchdog`
+   (off by default) automates this: a live `reviewer` dispatch at mutating turns / every few
+   tool calls, flagging correctness risk, test gaps, loop risk, scope drift, and unsafe changes.
