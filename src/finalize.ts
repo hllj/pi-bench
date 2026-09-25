@@ -49,6 +49,16 @@ export function mergeSealedResult({ taskId, untrusted, grade, judge, egress }: M
         .map((a: any) => ({ category: a.category, snippet: a.snippet.slice(0, 300) }))
     : [];
   result.egressAttempts = attempts;
+  // Skill/delegation telemetry (src/subagent-support.ts). Informational only.
+  result.skillsRead = Array.isArray(u.skillsRead)
+    ? u.skillsRead.filter((x: any) => typeof x === "string").slice(0, 50).map((x: string) => x.slice(0, 100))
+    : [];
+  result.delegationCalls = {};
+  if (u.delegationCalls && typeof u.delegationCalls === "object" && !Array.isArray(u.delegationCalls)) {
+    for (const [k, v] of Object.entries(u.delegationCalls).slice(0, 10)) {
+      if (typeof v === "number" && Number.isFinite(v)) result.delegationCalls[k.slice(0, 50)] = v;
+    }
+  }
   if (!untrusted) result.agentResultMissing = true;
 
   // Grade -> score.

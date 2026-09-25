@@ -68,3 +68,12 @@ describe("buildVerificationRetryPrompt", () => {
     expect(prompt.length).toBeLessThan(6000);
   });
 });
+
+describe("agent config access", () => {
+  test("keeps the working-directory fence but lets the agent read its own skills and use subagents", () => {
+    const prompt = buildAgentPrompt({ tmpDir: "/testbed", isSweContainer: true, taskPrompt: "fix it" });
+    expect(prompt).toContain("Do NOT explore, read, or modify files outside of your current working directory");
+    expect(prompt).toContain("~/.pi/agent");
+    expect(prompt).toContain("using skills and subagents is allowed");
+  });
+});

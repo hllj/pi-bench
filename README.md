@@ -42,7 +42,13 @@ A `[INFO] Score: 1` at the end means the agent, judge, and model auth are all wo
 
 - **`run-docker.sh` and `run-swe-bench.sh` mount your real `~/.pi/agent/{extensions,skills,prompts,agents,settings.json,AGENTS.md,npm}` into the container, read-only.** If `~/.pi/agent/extensions` is a symlink into a separate config repo (a common setup), the scripts detect that and mount the real target too, so the symlink resolves correctly inside the container. This means your custom tools, skills, prompt templates, and `settings.json` (including `defaultThinkingLevel`, `defaultModel`, etc.) apply the same way in a container as they do on your host.
 - **`auth.json`, `sessions/`, and `models-store.json` are deliberately *not* mounted.** Model/judge credentials for containerized runs come from `.env` → environment variables (see [API Keys](#api-keys) above), not from your host's stored credentials. This also avoids a real failure mode: `pi-ai`'s credential store creates a short-lived lock file on every auth read, even for a provider resolved via env var — mounting `auth.json` read-only breaks that with `EROFS`.
+- **Subagents** (pi-config's `subagent` extension, which runs each subagent as a separate `pi` process) work in both sealed and unsealed containers:
+  - `agents/` is mounted as a **staged copy**, not as-is (`scripts/stage-agents.ts`). `model:` overrides are dropped, so every subagent runs on the benchmarked model: the sealed gateway forwards nothing else, and a second model would otherwise count toward the score. `--exclude-tools` is also applied to each agent's `tools:` list, since the parent's exclusions don't reach child processes. The runner logs what it changed per agent. An agent with no `tools:` list gets every tool, and the log says so.
+  - In a container, the harness writes the effective (gateway/host-rewritten) `models.json` to `~/.pi/agent/models.json`, so child `pi` processes reach the model the same way the parent does.
+  - At startup it logs `Subagent runtime: pi <version>`, or a `[WARN]` if `pi` can't be run from `PATH`.
+  - Each result records `skillsRead` (skills whose `SKILL.md` the agent read) and `delegationCalls` (`subagent`/`run_dev_workflow`/`run_workflow` counts). These fields are informational and never affect the score.
 - **npm-installed extension packages** (declared via `settings.json`'s `packages`, e.g. `npm:pi-lens`) are picked up from your host's `~/.pi/agent/npm` if already installed there — the containers don't have `npm` on `PATH`, so an extension that isn't already installed on your host can't be installed fresh inside the container.
+- **To benchmark a candidate config without installing it**, set `PI_BENCH_AGENT_DIR` to a directory laid out like `~/.pi/agent` (for example, `extensions` symlinked to a pi-config worktree, plus a draft `AGENTS.md`). Both container runners mount that directory instead of `~/.pi/agent`.
 - To run without any of your personal config (a "clean" agent, closer to what a fresh SWE-bench evaluation container would have on its own), just don't mount `~/.pi/agent` — you'd need to fork the scripts or comment out the `RESOURCE_MOUNTS`/`EXTENSIONS_MOUNT` lines, there's no flag for this yet.
 
 ## Defining Tasks
@@ -240,6 +246,7 @@ bun run src/index.ts tasks/curated/easy.json
 | `--unsealed` | `run-swe-bench.sh` only: disable sealed mode (agent gets internet + the repo mount). Debugging only | sealed |
 | `--output-dir <dir>` | Write results here instead of the computed `benchmark_results/...` dir | computed |
 | `--consume-task` | Delete the task file right after reading it (used by sealed mode) | off |
+| `--print-excluded-tools` | Print the effective `--exclude-tools` list (comma-separated), then exit; used to stage subagent definitions | — |
 | `--print-egress-allowlist` | Print the `host:port` local model endpoint a sealed container may reach via the proxy (empty for remote APIs), then exit | — |
 | `--write-gateway-config <path>` | Write the key-holding gateway routes (incl. the real API key, mode 0600) to `<path>` and print the `PI_BENCH_GATEWAY` spec, then exit | — |
 | `--defer-grading` | Skip the in-container judge/score; the host grades in a fresh container (used by sealed mode) | off |

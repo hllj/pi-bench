@@ -7,8 +7,8 @@ import {
 import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
 import { buildJudgePrompt, decideScore, resolveJudgeModel, runJudge } from "./judge-run";
@@ -19,6 +19,7 @@ import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from ".
 import { scrubGitHistoryToOrphanBaseline } from "./git-scrub";
 import { applySweTestPatch, revertAgentTestModifications, revertAndApplySweTestPatch, runSweBenchTestCommand } from "./swe-tests";
 import { detectEgressAttempt, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type EgressAttempt } from "./egress";
+import { childModelsTarget, delegationKind, skillReadName } from "./subagent-support";
 import { applyGatewayOverrides, GATEWAY_HOST, GATEWAY_PORT, parseGatewaySpec, type GatewayRoute } from "./gateway";
 
 // Hostname that reaches the machine running the local inference server. A
@@ -131,6 +132,21 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       }
     }
 
+    // Subagents are separate `pi` processes that read their own models.json,
+    // not modelsPath -- hand them the same gateway/host-rewritten config (see
+    // src/subagent-support.ts). Container only: on the host this path is the
+    // user's real ~/.pi/agent/models.json.
+    if (isSweContainer && modelsPath) {
+      const childModels = childModelsTarget(process.env, homedir());
+      try {
+        await mkdir(dirname(childModels), { recursive: true });
+        await writeFile(childModels, await readFile(modelsPath, "utf-8"));
+        console.log(`[INFO] Subagent models config written to ${childModels}`);
+      } catch (e: any) {
+        console.warn(`[WARN] Could not write subagent models config to ${childModels}: ${e?.message ?? e}. Subagents may fail to reach the model.`);
+      }
+    }
+
     const modelRuntime = await ModelRuntime.create(modelsPath ? { modelsPath } : undefined);
     const modelRegistry = new ModelRegistry(modelRuntime);
 
@@ -172,6 +188,23 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     session.setActiveToolsByName(session.getAllTools().map((t) => t.name));
 
     console.log(`[INFO] Agent resolved to model: ${session.model?.provider}/${session.model?.id}`);
+
+    // The subagent extension spawns `pi` from PATH. `bun run` puts
+    // node_modules/.bin on PATH (and a `node` shim for its #!/usr/bin/env node
+    // shebang); check it actually resolves so a broken spawn shows up here,
+    // not as silently failed dispatches mid-run.
+    if (session.getAllTools().some((t) => t.name === "subagent")) {
+      try {
+        const { stdout } = await execAsync(`pi --version`, { timeout: 30000 });
+        console.log(`[INFO] Subagent runtime: pi ${stdout.trim()} (${(await execAsync("command -v pi")).stdout.trim()})`);
+      } catch (e: any) {
+        console.warn(`[WARN] Subagent tool is active but \`pi\` can't be run from PATH: ${String(e?.message ?? e).split("\n")[0]}. Dispatches will fail.`);
+      }
+    }
+
+    // Telemetry: did the agent load skills / delegate? (See ~/.pi/agent/AGENTS.md.)
+    const skillsRead: string[] = [];
+    const delegationCalls: Record<string, number> = {};
 
     let lastToolName = "";
     let lastToolArgs = "";
@@ -226,6 +259,17 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         let argsStr = "";
         try {
           argsStr = JSON.stringify(event.args);
+
+          const skill = skillReadName(event.toolName, event.args);
+          if (skill && !skillsRead.includes(skill)) {
+            skillsRead.push(skill);
+            console.log(`\n[INFO] Agent loaded skill: ${skill}`);
+          }
+          const delegation = delegationKind(event.toolName);
+          if (delegation) {
+            delegationCalls[delegation] = (delegationCalls[delegation] ?? 0) + 1;
+            console.log(`\n[INFO] Agent delegated via ${delegation}`);
+          }
 
           if (argsStr === lastToolArgs && event.toolName === lastToolName) {
             repeatedToolCount++;
@@ -666,6 +710,8 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       timeBudgetNudged: budgetNudgeIssued,
       egressAttemptCount,
       egressAttempts,
+      skillsRead,
+      delegationCalls,
       // True when the agent tried to pull upstream source/history. Under the
       // sealed network these attempts fail, so this is informational; on an
       // --unsealed run a passing result with this set should be treated as
@@ -727,6 +773,7 @@ async function main() {
       "inference-profile": { type: "string" },
       "print-output-dir": { type: "boolean" },
       "print-egress-allowlist": { type: "boolean" },
+      "print-excluded-tools": { type: "boolean" },
       "write-gateway-config": { type: "string" },
       "output-dir": { type: "string" },
       "consume-task": { type: "boolean" },
@@ -753,6 +800,12 @@ async function main() {
       : raw.split(",").map((t) => t.trim()).filter(Boolean);
   } else {
     excludeTools = DEFAULT_EXCLUDED_TOOLS;
+  }
+  // run-swe-bench.sh applies the same exclusions to the staged subagent
+  // definitions (scripts/stage-agents.ts) -- this list only covers the parent.
+  if (values["print-excluded-tools"]) {
+    console.log(excludeTools.join(","));
+    process.exit(0);
   }
   // console.error, not console.log: --print-output-dir's only stdout contract
   // is the directory path (run-swe-bench.sh captures it via `$(...)`), and
