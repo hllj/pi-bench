@@ -48,6 +48,7 @@ A `[INFO] Score: 1` at the end means the agent, judge, and model auth are all wo
   - At startup it logs `Subagent runtime: pi <version>`, or a `[WARN]` if `pi` can't be run from `PATH`.
   - Each result records `skillsRead` (skills whose `SKILL.md` the agent read) and `delegationCalls` (`subagent`/`run_dev_workflow`/`run_workflow` counts). These fields are informational and never affect the score.
 - **npm-installed extension packages** (declared via `settings.json`'s `packages`, e.g. `npm:pi-lens`) are picked up from your host's `~/.pi/agent/npm` if already installed there — the containers don't have `npm` on `PATH`, so an extension that isn't already installed on your host can't be installed fresh inside the container.
+- **To benchmark a candidate config without installing it**, set `PI_BENCH_AGENT_DIR` to a directory laid out like `~/.pi/agent` (for example, `extensions` symlinked to a pi-config worktree, plus a draft `AGENTS.md`). Both container runners mount that directory instead of `~/.pi/agent`.
 - To run without any of your personal config (a "clean" agent, closer to what a fresh SWE-bench evaluation container would have on its own), just don't mount `~/.pi/agent` — you'd need to fork the scripts or comment out the `RESOURCE_MOUNTS`/`EXTENSIONS_MOUNT` lines, there's no flag for this yet.
 
 ## Defining Tasks

@@ -17,7 +17,9 @@ docker build -t pi-bench-runner .
 # sources (e.g. "npm:pi-lens"), and createAgentSession() tries to
 # `npm install` any that aren't already present -- these containers don't
 # have npm on PATH, so without this mount that install crashes the run.
-AGENT_DIR="$HOME/.pi/agent"
+# PI_BENCH_AGENT_DIR points at an alternative config dir (same layout as
+# ~/.pi/agent) to benchmark a candidate config without installing it.
+AGENT_DIR="${PI_BENCH_AGENT_DIR:-$HOME/.pi/agent}"
 RESOURCE_MOUNTS=""
 for name in extensions skills prompts settings.json AGENTS.md npm; do
     if [ -e "$AGENT_DIR/$name" ]; then
