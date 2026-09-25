@@ -34,3 +34,6 @@ models-store.json
 # OS files
 .DS_Store
 Thumbs.db
+
+# sealed-mode per-task staging (run-swe-bench.sh)
+.pi-bench-stage/

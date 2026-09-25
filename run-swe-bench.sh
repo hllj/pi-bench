@@ -28,6 +28,7 @@ shift
 
 PASS_COUNT=1
 KEEP_IMAGES=0
+SEALED=1
 EXTRA_ARGS=""
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -37,6 +38,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --keep-images)
       KEEP_IMAGES=1
+      shift
+      ;;
+    --unsealed)
+      # Legacy mode: --network host + the whole repo bind-mounted read-write.
+      # The agent can reach PyPI/GitHub and read tasks/*.json (which contain
+      # the gold patch). Only for debugging the harness -- results from an
+      # unsealed run are not comparable to sealed ones.
+      SEALED=0
       shift
       ;;
     *)
@@ -117,7 +126,125 @@ echo "[INFO] SWE-bench Runner — $TOTAL tasks queued"
 if [ -n "$RESULTS_DIR" ]; then
   echo "[INFO] Results directory: $RESULTS_DIR"
 fi
+if [ "$SEALED" = "1" ]; then
+  echo "[INFO] Sealed mode: no internet for the agent, task answers not mounted (pass --unsealed to disable)"
+else
+  echo "[WARN] UNSEALED mode: the agent can reach PyPI/GitHub and read tasks/*.json -- results are not trustworthy"
+fi
 echo "========================================================"
+
+# ---------------------------------------------------------------------------
+# Sealed mode.
+#
+# Why: agents with open network access were observed downloading the real
+# upstream fix (`pip download sphinx==8.0.2 --no-binary :all:`, curl on
+# raw.githubusercontent.com/<repo>/<later tag>/..., api.github.com issue/PR
+# search) -- see src/egress.ts. And with the whole repo bind-mounted, every
+# task's gold patch (tasks/*.json `expectedDiff`, swe-bench-verified-mini.json
+# `patch`) was one `cat` away.
+#
+# How:
+#   1. The task container joins an `--internal` docker network: no route out.
+#   2. The only way out is the pi-bench-egress container (scripts/egress-proxy.ts):
+#      - a forward proxy that allows just a LOCAL model server
+#        (host.docker.internal:<port>, from --print-egress-allowlist), 403 for
+#        everything else (pip/git/curl/python, any process or tool);
+#      - a key-holding LLM gateway (src/gateway.ts) for REMOTE model APIs: the
+#        container calls it with no key; it only forwards the benchmarked model,
+#        rejects web-search features, and adds the real key. The agent
+#        container gets NO .env and no API key at all.
+#      Every decision is logged by that container (the agent can't touch it).
+#   3. Only the harness code is mounted (read-only), plus the toolchain volume
+#      (read-only). The task JSON is staged with expectedDiff stripped and
+#      deleted by the harness before the agent starts.
+#   4. The agent container's own results file is UNTRUSTED (the agent is root
+#      there). Grading happens in a FRESH container from the task image with
+#      `--network none` (src/grade.ts): only the agent's diff is applied, then
+#      the hidden tests run. The judge runs on this host, and
+#      scripts/finalize-sealed-result.ts writes the authoritative result.
+#   5. Toolchain (bun, rg, fd, node_modules) is prepared ONCE up front with
+#      network access, into the shared bun-cache volume.
+# ---------------------------------------------------------------------------
+SEALED_NETWORK="pi-bench-sealed"
+EGRESS_CONTAINER="pi-bench-egress"
+EGRESS_PROXY_URL="http://${EGRESS_CONTAINER}:3128"
+STAGE_ROOT="$PI_BENCH_DIR/.pi-bench-stage"
+
+if [ "$SEALED" = "1" ]; then
+  if [ -z "$RESULTS_DIR" ]; then
+    echo "[ERROR] Sealed mode needs the results directory up front, but 'src/index.ts --print-output-dir' failed."
+    echo "        (For local providers the inference server must be reachable from this host.)"
+    exit 1
+  fi
+
+  mkdir -p "$STAGE_ROOT"
+  EGRESS_ALLOW="${PI_BENCH_EGRESS_ALLOW:-$(bun run src/index.ts --print-egress-allowlist $EXTRA_ARGS 2>/dev/null || true)}"
+  # Holds the REAL API key: 0600, mounted read-only into the gateway container
+  # only, deleted on exit.
+  GATEWAY_CONFIG_FILE="$STAGE_ROOT/.gateway-config.json"
+  if ! GATEWAY_SPEC=$(bun run src/index.ts --write-gateway-config "$GATEWAY_CONFIG_FILE" $EXTRA_ARGS 2>/dev/null); then
+    echo "[ERROR] Could not configure the sealed LLM gateway (src/index.ts --write-gateway-config)."
+    exit 1
+  fi
+  if [ -z "$EGRESS_ALLOW" ] && [ -z "$GATEWAY_SPEC" ]; then
+    echo "[ERROR] Could not determine how the sealed container reaches the agent model."
+    echo "        Set PI_BENCH_EGRESS_ALLOW=host:port[,host:port...] explicitly."
+    exit 1
+  fi
+  # Fallback in case a client ignores NO_PROXY and sends the gateway request
+  # to the forward proxy instead: let the proxy hand it to the gateway.
+  if [ -n "$GATEWAY_SPEC" ]; then
+    EGRESS_ALLOW="${EGRESS_ALLOW:+$EGRESS_ALLOW,}${EGRESS_CONTAINER}:8787"
+  fi
+  echo "[INFO] Egress allowlist: ${EGRESS_ALLOW:-(none)}"
+  echo "[INFO] LLM gateway: ${GATEWAY_SPEC:-(none)}"
+
+  docker network inspect "$SEALED_NETWORK" >/dev/null 2>&1 || docker network create --internal "$SEALED_NETWORK" >/dev/null
+
+  docker rm -f "$EGRESS_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$EGRESS_CONTAINER" \
+    --add-host host.docker.internal:host-gateway \
+    -e EGRESS_ALLOW="$EGRESS_ALLOW" \
+    -e GATEWAY_CONFIG=/gateway-config.json \
+    -v "$GATEWAY_CONFIG_FILE:/gateway-config.json:ro" \
+    -v "$PI_BENCH_DIR/src:/proxy/src:ro" \
+    -v "$PI_BENCH_DIR/scripts:/proxy/scripts:ro" \
+    -w /proxy \
+    oven/bun:latest bun run scripts/egress-proxy.ts >/dev/null
+  docker network connect "$SEALED_NETWORK" "$EGRESS_CONTAINER"
+  trap 'docker rm -f "$EGRESS_CONTAINER" >/dev/null 2>&1 || true; rm -f "$GATEWAY_CONFIG_FILE"' EXIT
+
+  # One-time toolchain prep, WITH network, inside the first task's image so
+  # the binaries match its arch/libc. Idempotent: skips whatever the
+  # bun-cache volume already has.
+  FIRST_TASK_ID=$(python3 -c "import json; print(json.load(open('${TASK_FILES[0]}'))['id'])")
+  echo "[INFO] Preparing sealed toolchain (bun, rg, fd, node_modules) in ${REGISTRY}.${FIRST_TASK_ID} ..."
+  docker run --rm \
+    -v "$PI_BENCH_DIR:/pi-bench:z" \
+    -v "pi-bench-bun-cache:/root/.bun" \
+    "${REGISTRY}.${FIRST_TASK_ID}:latest" \
+    bash -c '
+      set -e
+      export PATH=/root/.bun/bin:$PATH
+      ARCH=$(uname -m)
+      if [ ! -f /root/.bun/bin/bun ]; then
+        for i in 1 2 3; do apt-get update -qq && break; rm -rf /var/lib/apt/lists/*; sleep 2; done
+        apt-get install -y -qq unzip >/dev/null 2>&1
+        curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+      fi
+      mkdir -p /root/.bun/bin
+      if [ ! -x /root/.bun/bin/rg ]; then
+        curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-${ARCH}-unknown-linux-musl.tar.gz" \
+          | tar -xz -C /tmp && cp /tmp/ripgrep-14.1.1-${ARCH}-unknown-linux-musl/rg /root/.bun/bin/rg
+      fi
+      if [ ! -x /root/.bun/bin/fd ]; then
+        curl -fsSL "https://github.com/sharkdp/fd/releases/download/v10.2.0/fd-v10.2.0-${ARCH}-unknown-linux-musl.tar.gz" \
+          | tar -xz -C /tmp && cp /tmp/fd-v10.2.0-${ARCH}-unknown-linux-musl/fd /root/.bun/bin/fd
+      fi
+      cd /pi-bench && (bun install --frozen-lockfile 2>/dev/null || bun install 2>/dev/null)
+      echo "[SETUP] toolchain ready: $(bun --version), $(rg --version | head -1), $(fd --version)"
+    '
+fi
 
 for task_file in "${TASK_FILES[@]}"; do
   COUNT=$((COUNT + 1))
@@ -150,48 +277,144 @@ for task_file in "${TASK_FILES[@]}"; do
     fi
 
     # Run container and tee output to a temp file so we can extract the results dir
-    LOGFILE=$(mktemp /tmp/pi-bench-log.XXXXXX)
-    docker run --init -it --rm --network host $ENV_ARGS \
-      -v "$PI_BENCH_DIR:/pi-bench:z" \
-      -v "pi-bench-bun-cache:/root/.bun" \
-      $RESOURCE_MOUNTS \
-      $EXTENSIONS_MOUNT \
-      "$IMAGE" \
-      bash -c "
-        set -e
+    if [ "$SEALED" = "1" ]; then
+      # Per-task staging dir: the ONLY rw mount of the agent container.
+      # task.json is the task WITHOUT expectedDiff (the judge runs on the host)
+      # and is deleted by the harness (--consume-task) before the agent starts.
+      STAGE="$STAGE_ROOT/${TASK_ID}-attempt${ATTEMPT}"
+      rm -rf "$STAGE" && mkdir -p "$STAGE/agent/out" "$STAGE/grade"
+      python3 -c "
+import json, sys
+t = json.load(open(sys.argv[1]))
+t.pop('expectedDiff', None)
+json.dump(t, open(sys.argv[2], 'w'))
+" "$task_file" "$STAGE/agent/task.json"
+      CODE_MOUNTS="-v $PI_BENCH_DIR/src:/pi-bench/src:ro -v $PI_BENCH_DIR/node_modules:/pi-bench/node_modules:ro"
+      for f in package.json bun.lock tsconfig.json models.json; do
+        [ -f "$PI_BENCH_DIR/$f" ] && CODE_MOUNTS="$CODE_MOUNTS -v $PI_BENCH_DIR/$f:/pi-bench/$f:ro"
+      done
+      TASK_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-        # Install unzip + ripgrep + bun (cached after first run via volume).
-        # apt-get update is retried a few times: under QEMU emulation (amd64
-        # image on an arm64 host) it can download a truncated package index,
-        # which then fails GPG verification -- almost always transient.
-        if [ ! -f /root/.bun/bin/bun ]; then
-          echo '[SETUP] Installing bun...'
-          for i in 1 2 3; do apt-get update -qq && break; rm -rf /var/lib/apt/lists/*; sleep 2; done
-          apt-get install -y -qq unzip ripgrep >/dev/null 2>&1
-          curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
-          echo '[SETUP] bun installed.'
-        fi
-        export PATH=/root/.bun/bin:\$PATH
+      # No $ENV_ARGS: the agent container gets no API keys. Remote models go
+      # through the gateway (PI_BENCH_GATEWAY), local ones through the proxy.
+      LOGFILE=$(mktemp /tmp/pi-bench-log.XXXXXX)
+      docker run --init -it --rm --network "$SEALED_NETWORK" \
+        -e PI_BENCH_SEALED=1 \
+        -e PI_BENCH_LOCAL_HOST=host.docker.internal \
+        -e PI_BENCH_GATEWAY="$GATEWAY_SPEC" \
+        -e PI_OFFLINE=1 \
+        -e HTTP_PROXY="$EGRESS_PROXY_URL" -e HTTPS_PROXY="$EGRESS_PROXY_URL" \
+        -e http_proxy="$EGRESS_PROXY_URL" -e https_proxy="$EGRESS_PROXY_URL" \
+        -e NO_PROXY="localhost,127.0.0.1,$EGRESS_CONTAINER" -e no_proxy="localhost,127.0.0.1,$EGRESS_CONTAINER" \
+        $CODE_MOUNTS \
+        -v "$STAGE/agent:/pi-bench-io:z" \
+        -v "pi-bench-bun-cache:/root/.bun:ro" \
+        $RESOURCE_MOUNTS \
+        $EXTENSIONS_MOUNT \
+        -w /pi-bench \
+        "$IMAGE" \
+        bash -c "
+          set -e
+          export PATH=/root/.bun/bin:\$PATH
+          for bin in bun rg fd; do
+            command -v \$bin >/dev/null || { echo \"[ERROR] \$bin missing from the bun-cache volume -- sealed toolchain prep failed\"; exit 1; }
+          done
+          source /opt/miniconda3/etc/profile.d/conda.sh
+          conda activate testbed
+          bun run src/index.ts /pi-bench-io/task.json --consume-task --defer-grading --output-dir /pi-bench-io/out $EXTRA_ARGS
+        " 2>&1 | tee "$LOGFILE"
+      EXIT_CODE=${PIPESTATUS[0]}
 
-        # Ensure unzip + ripgrep are available (bun cache might exist from a previous run but these might not be in this container)
-        if ! which unzip >/dev/null 2>&1 || ! which rg >/dev/null 2>&1; then
-          for i in 1 2 3; do apt-get update -qq && break; rm -rf /var/lib/apt/lists/*; sleep 2; done
-          apt-get install -y -qq unzip ripgrep >/dev/null 2>&1
-        fi
+      if [ $EXIT_CODE -ne 2 ]; then
+        # Everything under $STAGE/agent was writable by the agent: take ONLY
+        # the diff from its results file into the grader's input.
+        AGENT_RESULT="$STAGE/agent/out/results-${TASK_ID}.json"
+        python3 -c "
+import json, sys
+task = json.load(open(sys.argv[1]))
+diff = ''
+try:
+    d = json.load(open(sys.argv[2])).get('diff')
+    diff = d if isinstance(d, str) else ''
+except Exception:
+    pass
+json.dump({'task': {k: task.get(k) for k in ('id', 'repo', 'failToPass', 'testPatch')}, 'diff': diff}, open(sys.argv[3], 'w'))
+" "$task_file" "$AGENT_RESULT" "$STAGE/grade/grade-input.json"
 
-        # Install pi-bench dependencies (fast if node_modules exists from bind mount)
-        cd /pi-bench && bun install --frozen-lockfile 2>/dev/null || bun install 2>/dev/null
+        # Fresh container from the pristine task image, no network, nothing
+        # from the agent container except that diff.
+        echo "[INFO] Grading $TASK_ID in a fresh container..."
+        docker run --init --rm --network none \
+          -v "$PI_BENCH_DIR/src:/pi-bench/src:ro" \
+          -v "$STAGE/grade:/grade:z" \
+          -v "pi-bench-bun-cache:/root/.bun:ro" \
+          -w /pi-bench \
+          "$IMAGE" \
+          bash -c "
+            export PATH=/root/.bun/bin:\$PATH
+            source /opt/miniconda3/etc/profile.d/conda.sh
+            conda activate testbed
+            bun run src/grade.ts /grade/grade-input.json /grade/grade.json
+          " 2>&1 | grep --line-buffered -E '^\[(GRADE|INFO|WARN|ERROR)\]' || true
 
-        # Activate the SWE-bench testbed conda environment so 'python' resolves
-        # to the correct version (e.g. Python 3.6 for Django, 3.8+ for Sphinx)
-        source /opt/miniconda3/etc/profile.d/conda.sh
-        conda activate testbed
+        docker logs --since "$TASK_START" "$EGRESS_CONTAINER" > "$STAGE/egress.jsonl" 2>/dev/null || true
+        mkdir -p "$RESULTS_DIR"
+        bun run scripts/finalize-sealed-result.ts \
+          --task "$task_file" \
+          --grade "$STAGE/grade/grade.json" \
+          --agent-result "$AGENT_RESULT" \
+          --egress-log "$STAGE/egress.jsonl" \
+          --out "$RESULTS_DIR/results-${TASK_ID}.json" \
+          $EXTRA_ARGS
+        for f in "$STAGE"/agent/out/transcript-*.json "$STAGE"/agent/out/run-meta.json; do
+          [ -f "$f" ] && mv "$f" "$RESULTS_DIR/"
+        done
+      fi
+      rm -rf "$STAGE"
+    else
+      LOGFILE=$(mktemp /tmp/pi-bench-log.XXXXXX)
+      docker run --init -it --rm --network host $ENV_ARGS \
+        -v "$PI_BENCH_DIR:/pi-bench:z" \
+        -v "pi-bench-bun-cache:/root/.bun" \
+        $RESOURCE_MOUNTS \
+        $EXTENSIONS_MOUNT \
+        "$IMAGE" \
+        bash -c "
+          set -e
 
-        # Run the benchmark
-        bun run src/index.ts $REL_TASK_FILE $EXTRA_ARGS
-      " 2>&1 | tee "$LOGFILE"
+          # Install unzip + ripgrep + bun (cached after first run via volume).
+          # apt-get update is retried a few times: under QEMU emulation (amd64
+          # image on an arm64 host) it can download a truncated package index,
+          # which then fails GPG verification -- almost always transient.
+          if [ ! -f /root/.bun/bin/bun ]; then
+            echo '[SETUP] Installing bun...'
+            for i in 1 2 3; do apt-get update -qq && break; rm -rf /var/lib/apt/lists/*; sleep 2; done
+            apt-get install -y -qq unzip ripgrep >/dev/null 2>&1
+            curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+            echo '[SETUP] bun installed.'
+          fi
+          export PATH=/root/.bun/bin:\$PATH
 
-    EXIT_CODE=${PIPESTATUS[0]}
+          # Ensure unzip + ripgrep are available (bun cache might exist from a previous run but these might not be in this container)
+          if ! which unzip >/dev/null 2>&1 || ! which rg >/dev/null 2>&1; then
+            for i in 1 2 3; do apt-get update -qq && break; rm -rf /var/lib/apt/lists/*; sleep 2; done
+            apt-get install -y -qq unzip ripgrep >/dev/null 2>&1
+          fi
+
+          # Install pi-bench dependencies (fast if node_modules exists from bind mount)
+          cd /pi-bench && bun install --frozen-lockfile 2>/dev/null || bun install 2>/dev/null
+
+          # Activate the SWE-bench testbed conda environment so 'python' resolves
+          # to the correct version (e.g. Python 3.6 for Django, 3.8+ for Sphinx)
+          source /opt/miniconda3/etc/profile.d/conda.sh
+          conda activate testbed
+
+          # Run the benchmark
+          bun run src/index.ts $REL_TASK_FILE $EXTRA_ARGS
+        " 2>&1 | tee "$LOGFILE"
+
+      EXIT_CODE=${PIPESTATUS[0]}
+    fi
 
     # Capture the results directory from container output (first occurrence only)
     if [ -z "$RESULTS_DIR" ]; then

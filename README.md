@@ -163,7 +163,32 @@ After the agent finishes editing code, the runner:
 4. **The LLM Judge** receives both the diff and the test results and provides a human-readable rationale explaining *why* the fix worked or didn't. Its raw verdict is preserved separately as `judgeModelScore` (useful for measuring judge/test agreement over time), even when it's overridden by the test result. The judge call is retried up to 3 times on unparseable output before falling back to the test result.
 5. If the judge and agent are configured to the same model, the run logs a `[WARN] Judge model is the SAME as the agent model` notice — worth knowing, though it no longer affects the score for container tasks since the test decides it.
 
-This combines the objectivity of SWE-bench's test-based evaluation with the explainability of an LLM judge. Each result JSON also records `scoreSource` (`"container-test"` | `"judge"` | `"judge-parse-failed"`), `judgeParseFailed`, `judgeAttempts`, `judgeModel`, `timedOut`, `loopRecoveries` (how many times the agent got stuck in a tool-call loop and had to be redirected), `verificationRetries` (`1` if the fix failed the real `FAIL_TO_PASS` tests and the agent was given its one corrective pass with the actual failure output, otherwise `0`), and `archaeologyNudges` (how many times the agent was nudged out of a git-history exploration streak with no file edits, capped at 2 per task) for later analysis.
+#### Sealed mode (anti-cheat, on by default)
+With open network access, agents were observed fetching the real upstream fix instead of solving the task: `pip download sphinx==8.0.2 --no-binary :all:`, `curl https://raw.githubusercontent.com/<repo>/<later tag>/...`, Python `urllib` against `api.github.com/search/issues` to find the fixing PR. `bun run scripts/audit-egress.ts` found this in 12–19 of 50 tasks in each `deepseek-v4-flash-0731` run, most of them scored as passes. Separately, with the whole repo bind-mounted, every task's gold patch (`tasks/*.json` → `expectedDiff`) was one `cat` away.
+
+`run-swe-bench.sh` therefore runs every task **sealed**:
+
+1. **No route out.** The task container joins an `--internal` docker network (`pi-bench-sealed`). Its only exit is the `pi-bench-egress` container (`scripts/egress-proxy.ts`). As a forward proxy it allows a *local* model server only (`host.docker.internal:<port>`, from `src/index.ts --print-egress-allowlist`). Everything else gets HTTP 403: pip, git, curl, Python, subagents, and in-process extension tools alike. Unsetting the proxy env doesn't help, because the container has no DNS and no route.
+2. **No API key in the container.** Remote model APIs (OpenRouter) are reached only through a key-holding gateway on the same container (`src/gateway.ts`, port 8787). The agent container gets no `.env` and calls the gateway without a key. The gateway forwards only `POST /chat/completions` for the exact model being benchmarked, adds the real key, and rejects everything else: other or stronger models, `:online` variants, the `web` plugin, `web_search_options`, fallback `models`, and non-function tools. The key lives in a 0600 file mounted only into the gateway container (`--write-gateway-config`) and is deleted when the run ends.
+3. **No answers in the container.** Only `src/`, `node_modules/` and the manifest/`models.json` files are mounted, read-only. The toolchain volume is read-only too. The task JSON is staged with `expectedDiff` removed, and the harness deletes it (`--consume-task`) before the agent starts.
+4. **Graded in a fresh container.** The agent is root in its own container, so nothing graded there can be trusted (for example, a `sitecustomize.py` in the writable `site-packages` can no-op every test). With `--defer-grading`, the in-container FAIL_TO_PASS run only feeds the verification retry. After the agent exits, `src/grade.ts` runs in a **new container from the pristine task image with `--network none`**. It applies *only* the agent's diff and then runs the hidden tests. A diff that adds `sitecustomize.py`, `usercustomize.py`, a `.pth` file, or a `conftest.py` outside the test dirs is rejected (`scoreSource: "tamper-rejected"`). An exit code of 0 must also be backed by every FAIL_TO_PASS test being reported as passed in the output (django `... ok`, pytest `-rA` `PASSED <id>`). Otherwise it's scored as a fail, and the missing ids are recorded as `unconfirmedTests`.
+5. **Authoritative result written on the host.** `scripts/finalize-sealed-result.ts` runs the LLM judge on the host (so the container never needs `expectedDiff` or a judge key). It builds `results-<id>.json` from the fresh grade (`scoreSource: "fresh-container-test"`, `gradedInFreshContainer: true`), and from the agent container's file it takes only the diff and a whitelist of type-checked telemetry. That file is untrusted: a forged score or a self-declared harness error is ignored. The proxy's own log for the task window becomes `egressDeniedByProxy` and `egressDeniedTargets`.
+6. **Toolchain prepared once.** Sealed containers can't `apt-get` or `curl`. So `bun`, `rg`, `fd` and `node_modules` are installed once, with network, into the `pi-bench-bun-cache` volume before the first task (task containers mount it read-only). `PI_OFFLINE=1` stops pi from trying to download them itself.
+
+`PI_BENCH_EGRESS_ALLOW=host:port,...` overrides the computed allowlist. `--unsealed` restores the old behavior (`--network host`, whole repo mounted read-write). Use it only for debugging the harness: unsealed results aren't comparable to sealed ones.
+
+To check existing (unsealed) runs for contamination:
+```bash
+bun run scripts/audit-egress.ts benchmark_results          # per-run table + contaminated passes
+bun run scripts/audit-egress.ts benchmark_results --mark   # also write the egress fields into results-*.json
+```
+
+Known residual risks:
+- **Harness memory.** The in-container harness still holds the task's `testPatch` (needed for the verification retry), and a root agent can read another process's memory via `/proc/<pid>/mem`. This leaks the hidden tests, not the gold patch, and the retry already shows their output.
+- **Diff-visible rigging.** A diff could still rig the test run from inside the repo in ways neither the filename rule nor the per-test check catches (for example, printing fake `... ok` lines). That would be plainly visible in the stored diff.
+- **Unsealed modes.** `run-docker.sh` (curated tasks) and local mode are not sealed.
+
+This combines the objectivity of SWE-bench's test-based evaluation with the explainability of an LLM judge. Each result JSON also records `scoreSource` (`"container-test"` | `"fresh-container-test"` | `"tamper-rejected"` | `"grade-error"` | `"harness-error"` | `"judge"` | `"judge-parse-failed"`), `judgeParseFailed`, `judgeAttempts`, `judgeModel`, `timedOut`, `loopRecoveries` (how many times the agent got stuck in a tool-call loop and had to be redirected), `verificationRetries` (`1` if the fix failed the real `FAIL_TO_PASS` tests and the agent was given its one corrective pass with the actual failure output, otherwise `0`), and `archaeologyNudges` (how many times the agent was nudged out of a git-history exploration streak with no file edits, capped at 2 per task) for later analysis.
 
 ### Curated Tasks (Docker sandbox)
 
@@ -212,6 +237,12 @@ bun run src/index.ts tasks/curated/easy.json
 | `--context <tokens>` | Override model context window size for this run | From `models.json` |
 | `--timeout <minutes>` | Agent timeout per task | `30` |
 | `--pass <N>` | Number of attempts to make per task (retries on failure) | `1` |
+| `--unsealed` | `run-swe-bench.sh` only: disable sealed mode (agent gets internet + the repo mount). Debugging only | sealed |
+| `--output-dir <dir>` | Write results here instead of the computed `benchmark_results/...` dir | computed |
+| `--consume-task` | Delete the task file right after reading it (used by sealed mode) | off |
+| `--print-egress-allowlist` | Print the `host:port` local model endpoint a sealed container may reach via the proxy (empty for remote APIs), then exit | — |
+| `--write-gateway-config <path>` | Write the key-holding gateway routes (incl. the real API key, mode 0600) to `<path>` and print the `PI_BENCH_GATEWAY` spec, then exit | — |
+| `--defer-grading` | Skip the in-container judge/score; the host grades in a fresh container (used by sealed mode) | off |
 | `--exclude-tools <list\|none>` | Comma-separated tool names to disable, or `none` to allow everything | `web_search,web_fetch,question,questionnaire` |
 
 `--exclude-tools` defaults to disabling `web_search` and `web_fetch` (if your `~/.pi/agent` extensions register them) so the agent can't look up the real upstream fix online instead of solving the task, and `question`/`questionnaire` since no human is ever attached to a benchmark run — they fail cleanly rather than hang, but there's no reason to let a task burn a turn reaching for one — pass `--exclude-tools none` to allow all tools, or your own comma-separated list to disable a different set.

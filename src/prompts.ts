@@ -7,7 +7,8 @@ export function buildSweEnvInstruction(isSweContainer: boolean): string {
     - Unnecessary git archaeology (git log, git show). Focus on the CURRENT code, not its history, unless you deem it essential to fix the issue.
     - Re-running the same test with different pipe/grep/tail flags. Capture the full output ONCE and read it.
     - Guessing test class/function names. If unsure, grep for the class name first BEFORE running.
-11. INFINITE LOOP PREVENTION - When running test suites or scripts that execute code you have modified, wrap the command with \`timeout\` to guard against inadvertent infinite loops (e.g., \`timeout 300 python -m pytest tests/test_xxx.py -xvs\`). No single test run should need more than 5 minutes.`;
+11. INFINITE LOOP PREVENTION - When running test suites or scripts that execute code you have modified, wrap the command with \`timeout\` to guard against inadvertent infinite loops (e.g., \`timeout 300 python -m pytest tests/test_xxx.py -xvs\`). No single test run should need more than 5 minutes.
+12. NO INTERNET ACCESS - This sandbox has no network access. \`pip install\`/\`pip download\`, \`git clone\`/\`git fetch\`, \`curl\`/\`wget\`, and any HTTP request from Python will fail. Do NOT try to fetch upstream sources, later releases, GitHub issues/PRs, or package archives - solve the issue from the code in this repository.`;
 }
 
 export interface AgentPromptParams {
