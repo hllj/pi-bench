@@ -18,8 +18,11 @@
 //   EGRESS_PORT    listen port (default 3128)
 
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
+import { existsSync, readFileSync } from "node:fs";
 import { isEgressAllowed, parseEgressAllowlist } from "../src/egress";
+import { checkGatewayRequest, parseGatewayPath, type GatewayRoute } from "../src/gateway";
 
 const allow = parseEgressAllowlist(process.env.EGRESS_ALLOW || "");
 const listenPort = Number(process.env.EGRESS_PORT || 3128);
@@ -93,3 +96,73 @@ server.on("connect", (req, clientSocket: net.Socket, head) => {
 server.listen(listenPort, "0.0.0.0", () => {
   console.error(`[egress-proxy] listening on :${listenPort}, allow=${[...allow].join(",") || "(nothing)"}`);
 });
+
+// ---------------------------------------------------------------------------
+// Key-holding LLM gateway (src/gateway.ts). The sealed container calls
+// http://pi-bench-egress:8787/<route>/chat/completions WITHOUT a key; the
+// real key only ever lives here, read from GATEWAY_CONFIG (a 0600 file the
+// host writes and mounts read-only into this container alone).
+// ---------------------------------------------------------------------------
+const gatewayConfigPath = process.env.GATEWAY_CONFIG;
+const gatewayPort = Number(process.env.GATEWAY_PORT || 8787);
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+
+if (gatewayConfigPath && existsSync(gatewayConfigPath)) {
+  const routes: GatewayRoute[] = JSON.parse(readFileSync(gatewayConfigPath, "utf-8")).routes || [];
+  const byName = new Map(routes.map((r) => [r.name, r]));
+
+  const gateway = http.createServer((req, res) => {
+    const deny = (status: number, reason: string, model?: unknown) => {
+      console.log(JSON.stringify({ ts: new Date().toISOString(), decision: "deny", method: req.method, target: `gateway${req.url}`, model, reason, client: req.socket.remoteAddress }));
+      res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: `pi-bench gateway: ${reason}` } }));
+    };
+    const parsed = parseGatewayPath(req.url || "");
+    const route = parsed && byName.get(parsed.name);
+    if (!parsed || !route) return deny(404, "unknown route");
+
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) req.destroy();
+      else chunks.push(c);
+    });
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks);
+      let body: any = null;
+      try {
+        body = JSON.parse(raw.toString("utf-8"));
+      } catch {}
+      const check = checkGatewayRequest(route, req.method || "", parsed.subpath, body);
+      if (!check.ok) return deny(403, check.reason, body?.model);
+
+      console.log(JSON.stringify({ ts: new Date().toISOString(), decision: "allow", method: req.method, target: `gateway/${route.name}${parsed.subpath}`, model: body.model, client: req.socket.remoteAddress }));
+      const upstreamUrl = new URL(route.upstream.replace(/\/$/, "") + parsed.subpath);
+      const client = upstreamUrl.protocol === "https:" ? https : http;
+      const upstream = client.request(
+        upstreamUrl,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: (req.headers.accept as string) || "application/json",
+            authorization: `Bearer ${route.key}`,
+            "content-length": String(raw.length),
+          },
+        },
+        (up) => {
+          res.writeHead(up.statusCode || 502, up.headers);
+          up.pipe(res);
+        }
+      );
+      upstream.on("error", (e) => {
+        if (!res.headersSent) res.writeHead(502);
+        res.end(`pi-bench gateway: upstream error: ${e.message}\n`);
+      });
+      upstream.end(raw);
+    });
+  });
+  gateway.listen(gatewayPort, "0.0.0.0", () => {
+    console.error(`[egress-proxy] gateway listening on :${gatewayPort}, routes=${routes.map((r) => `${r.name}->${r.upstream} [${r.models.join(",")}]`).join("; ")}`);
+  });
+}

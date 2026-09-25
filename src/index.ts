@@ -11,13 +11,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
-import { parseJudgeOutput } from "./judge";
+import { buildJudgePrompt, decideScore, resolveJudgeModel, runJudge } from "./judge-run";
 import { buildAgentPrompt, buildVerificationRetryPrompt } from "./prompts";
 import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
 import { extractDjangoTestModules, validateFailToPass } from "./task-validation";
 import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from "./config-guard";
 import { scrubGitHistoryToOrphanBaseline } from "./git-scrub";
+import { applySweTestPatch, revertAgentTestModifications, revertAndApplySweTestPatch, runSweBenchTestCommand } from "./swe-tests";
 import { detectEgressAttempt, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type EgressAttempt } from "./egress";
+import { applyGatewayOverrides, GATEWAY_HOST, GATEWAY_PORT, parseGatewaySpec, type GatewayRoute } from "./gateway";
 
 // Hostname that reaches the machine running the local inference server. A
 // sealed SWE container (run-swe-bench.sh) has no route to the host's
@@ -25,147 +27,15 @@ import { detectEgressAttempt, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type
 // URLs are rewritten to go through the egress proxy.
 const LOCAL_HOST = process.env.PI_BENCH_LOCAL_HOST || "localhost";
 
+// Providers reached through the key-holding gateway (src/gateway.ts) in a
+// sealed container: their baseUrl is pointed at the gateway and the API key
+// replaced with a placeholder -- the container never holds a real key.
+const GATEWAYS = parseGatewaySpec(process.env.PI_BENCH_GATEWAY);
+
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
-// Base test timeout, scaled up for tasks with many FAIL_TO_PASS entries: a
-// fixed 300s cap regardless of F2P count either kills a large django
-// multi-module run early or wastes 300s waiting on a single fast pytest node.
-const BASE_TEST_TIMEOUT_MS = 300_000;
-const PER_TEST_TIMEOUT_MS = 120_000;
-const MAX_TEST_TIMEOUT_MS = 1_200_000; // 20 min hard cap regardless of F2P count
-
-function scaledTestTimeoutMs(failToPassCount: number): number {
-  return Math.min(MAX_TEST_TIMEOUT_MS, Math.max(BASE_TEST_TIMEOUT_MS, failToPassCount * PER_TEST_TIMEOUT_MS));
-}
-
-type SweTestPlan =
-  | { kind: "shell"; command: string; timeoutMs: number }
-  | { kind: "execFile"; file: string; args: string[]; timeoutMs: number }
-  | { kind: "invalid"; reason: string };
-
-// SWE-bench container test command builder. Refuses to build a command at
-// all when FAIL_TO_PASS is malformed (see src/task-validation.ts) rather
-// than silently falling back to running the FULL test suite (django, empty
-// module list) or handing pytest a nonexistent node id (sphinx) -- both
-// observed on the verified-mini import (django__django-12209,
-// sphinx-doc__sphinx-8265; see plans/improvement-plan.md P0 items 1-2). The
-// caller must treat "invalid" as scoreSource: "harness-error", never run
-// anything, and exclude the task from pass-rate.
-function buildSweTestPlan(task: any): SweTestPlan {
-  const python = "/opt/miniconda3/envs/testbed/bin/python";
-  const failToPass: string[] = task.failToPass || [];
-  const validation = validateFailToPass(task.repo, failToPass);
-  if (!validation.valid) {
-    return {
-      kind: "invalid",
-      reason: `malformed FAIL_TO_PASS entr${validation.invalidIds.length === 1 ? "y" : "ies"}: ${JSON.stringify(validation.invalidIds)}`,
-    };
-  }
-  const timeoutMs = scaledTestTimeoutMs(failToPass.length);
-
-  if (task.repo === "django/django") {
-    const modules = extractDjangoTestModules(failToPass);
-    if (modules.length === 0) {
-      // Should be unreachable now that failToPass is validated above, but
-      // this is the exact condition that silently ran the full suite before
-      // -- keep the guard so a future validator gap fails loudly instead.
-      return { kind: "invalid", reason: "no test modules could be extracted from FAIL_TO_PASS" };
-    }
-    // Django's runtests.py returns exit 0 even on failures, so we wrap the
-    // command to parse the output and return a proper exit code. --failfast
-    // stops at the first failure instead of running every extracted module
-    // to completion.
-    return {
-      kind: "shell",
-      command: `${python} /testbed/tests/runtests.py ${modules.join(" ")} --verbosity 2 --failfast 2>&1 | tee /tmp/test_output.txt; grep -q "^OK" /tmp/test_output.txt`,
-      timeoutMs,
-    };
-  }
-
-  if (task.repo === "sphinx-doc/sphinx") {
-    // Sphinx uses pytest; FAIL_TO_PASS entries are pytest node IDs. Passed as
-    // an argv array (execFile, no shell) rather than interpolated into a
-    // shell string -- node ids can contain quotes, brackets, commas and
-    // parens (e.g. test_unparse[b'bytes'-b'bytes']) that a shell would
-    // otherwise need fragile escaping for. -x stops at the first failure.
-    return { kind: "execFile", file: python, args: ["-m", "pytest", ...failToPass, "-x", "-vs"], timeoutMs };
-  }
-
-  // Generic fallback: run pytest
-  return { kind: "shell", command: `cd /testbed && ${python} -m pytest --tb=short`, timeoutMs };
-}
-
-// Restores the repo's standard test directories to HEAD and drops any
-// untracked files the agent added there. Used before EVERY acceptance-test
-// run so (a) the official SWE-bench test patch applies cleanly and (b) the
-// agent can never force a pass by editing the tests it is scored against.
-// IMPORTANT: Each directory MUST be reverted in its own command.
-// Passing multiple paths (e.g. `git checkout -- tests/ test/ testing/`)
-// causes git to abort the ENTIRE operation if ANY pathspec doesn't match,
-// silently leaving all test files un-reverted.
-async function revertAgentTestModifications(tmpDir: string): Promise<void> {
-  console.log(`[INFO] Reverting agent test modifications to avoid conflicts...`);
-  for (const testDir of ['tests/', 'test/', 'testing/']) {
-    try {
-      // Single atomic operation: restores both index and working tree to HEAD
-      await execAsync(`git checkout HEAD -- ${testDir}`, { cwd: tmpDir });
-      console.log(`[INFO] Reverted ${testDir} to HEAD.`);
-    } catch {
-      // Directory doesn't exist in this repo — expected, not an error
-    }
-  }
-  // Clean any untracked files the agent may have added in test directories
-  await execAsync(`git clean -fd tests/ test/ testing/ 2>/dev/null || true`, { cwd: tmpDir });
-}
-
-// Writes and applies the official SWE-bench test patch. The patch file is
-// always removed afterwards (even on failure) so that a later `git add .`
-// (see getDiff) can never stage the official test patch into the agent's
-// stored diff.
-async function applySweTestPatch(tmpDir: string, testPatch: string): Promise<void> {
-  const patchPath = join(tmpDir, "swe_test.patch");
-  await writeFile(patchPath, testPatch);
-  try {
-    try {
-      await execAsync(`git apply swe_test.patch`, { cwd: tmpDir });
-    } catch {
-      console.log(`[INFO] Standard git apply failed, trying 3-way merge...`);
-      await execAsync(`git apply --3way swe_test.patch`, { cwd: tmpDir });
-    }
-    console.log(`[INFO] Test patch applied successfully.`);
-  } finally {
-    await rm(patchPath, { force: true });
-  }
-}
-
-// Full "make the acceptance tests pristine again, then install them" sequence.
-async function revertAndApplySweTestPatch(tmpDir: string, testPatch: string): Promise<void> {
-  await revertAgentTestModifications(tmpDir);
-  await applySweTestPatch(tmpDir, testPatch);
-}
-
-async function runSweBenchTestCommand(tmpDir: string, task: any): Promise<{ testExitCode: number | null; testOutput: string; harnessError?: boolean }> {
-  const plan = buildSweTestPlan(task);
-  if (plan.kind === "invalid") {
-    console.error(`[ERROR] Refusing to run SWE-bench test -- ${plan.reason}`);
-    return { testExitCode: null, testOutput: `HARNESS_ERROR: ${plan.reason}`, harnessError: true };
-  }
-  console.log(`[INFO] SWE test command: ${plan.kind === "shell" ? plan.command : `${plan.file} ${plan.args.join(" ")}`}`);
-  try {
-    const { stdout, stderr } = plan.kind === "shell"
-      ? await execAsync(plan.command, { cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: plan.timeoutMs })
-      : await execFileAsync(plan.file, plan.args, { cwd: tmpDir, maxBuffer: 10 * 1024 * 1024, timeout: plan.timeoutMs });
-    console.log(`[INFO] SWE-bench test exit code: 0`);
-    return { testExitCode: 0, testOutput: `STDOUT:\n${stdout}\nSTDERR:\n${stderr}` };
-  } catch (error: any) {
-    const testExitCode = error.code ?? 1;
-    console.log(`[INFO] SWE-bench test exit code: ${testExitCode}`);
-    return { testExitCode, testOutput: `STDOUT:\n${error.stdout || ""}\nSTDERR:\n${error.stderr || ""}\nERROR: ${error.message}` };
-  }
-}
-
-async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[], consumeTask = false) {
+async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[], consumeTask = false, deferGrading = false) {
   const taskContent = await readFile(taskFile, "utf-8");
   const task = JSON.parse(taskContent);
   if (consumeTask) {
@@ -227,7 +97,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     let modelsPath: string | undefined;
     if (existsSync(localModelsPath)) {
       console.log(`[INFO] Using local models.json configuration`);
-      if (port || LOCAL_HOST !== "localhost") {
+      if (port || LOCAL_HOST !== "localhost" || Object.keys(GATEWAYS).length > 0) {
         const modelsContent = await readFile(localModelsPath, "utf-8");
         const modelsData = JSON.parse(modelsContent);
         if (port && modelsData.providers && modelsData.providers[provider] && modelsData.providers[provider].baseUrl) {
@@ -236,6 +106,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         for (const p of Object.values<any>(modelsData.providers || {})) {
           if (p && typeof p.baseUrl === "string") p.baseUrl = rewriteLocalBaseUrl(p.baseUrl, LOCAL_HOST);
         }
+        applyGatewayOverrides(modelsData, GATEWAYS);
         const tmpModelsPath = tmpDir + "-models.json";
         await writeFile(tmpModelsPath, JSON.stringify(modelsData));
         modelsPath = tmpModelsPath;
@@ -729,150 +600,50 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       }
     }
 
-    console.log(`[INFO] Running LLM judge...`);
-    // The resolved agent model (what the agent session actually uses) is the
-    // judge default here; keep a reference to detect self-grading correctly.
-    const defaultJudgeModel = session.state.model as any;
-    let judgeModel = defaultJudgeModel;
-    if (judgeModelReq) {
-      const resolvedJudgeModel = modelRegistry.find(judgeModelReq.provider, judgeModelReq.id);
-      if (resolvedJudgeModel) {
-        judgeModel = resolvedJudgeModel;
-      } else {
-        console.warn(`[WARN] Could not resolve judge model ${judgeModelReq.provider}/${judgeModelReq.id}. Using default.`);
-      }
-    }
-    if (!judgeModel) throw new Error("Judge model not found");
-    // Self-grading check: compare against the RESOLVED agent model, on BOTH
-    // provider and id. Same id on a different provider (e.g. local ds4 vs
-    // openrouter both exposing "deepseek-v4-flash") is NOT self-grading, and
-    // comparing the raw CLI request would silently miss local-provider runs.
-    if (
-      defaultJudgeModel &&
-      judgeModel.provider === defaultJudgeModel.provider &&
-      judgeModel.id === defaultJudgeModel.id
-    ) {
-      console.warn(`\n[WARN] Judge model is the SAME as the agent model (${judgeModel.provider}/${judgeModel.id}) — the model is grading its own output.
-For SWE-bench tasks the container test now decides the score, so this only affects the rationale.
-Pass --judge-model (e.g. openrouter/deepseek/deepseek-v4-pro) for an independent judge.\n`);
-    }
-    console.log(`[INFO] Judge model: ${judgeModel.provider}/${judgeModel.id}`);
-    const auth = await modelRegistry.getApiKeyAndHeaders(judgeModel);
-    if (!auth.ok) throw new Error("Judge auth failed: " + auth.error);
-
-    let expectedDiff = task.expectedDiff || "";
-    if (task.solutionCommit) {
-      console.log(`[INFO] Fetching solution commit ${task.solutionCommit} to generate expected diff...`);
-      await execAsync(`git fetch --depth 1 origin ${task.solutionCommit}`, { cwd: tmpDir });
-      try {
-        const { stdout } = await execAsync(`git diff ${task.commit} ${task.solutionCommit}`, { cwd: tmpDir });
-        expectedDiff = stdout;
-      } catch (e) {
-        console.warn(`[WARN] Failed to generate diff for solution commit:`, e);
-      }
-    }
-
-    const judgeSystemPrompt = `You are an expert software engineer reviewing the output of an AI coding agent.
-You will be provided with the task prompt, the expected behavior, the git diff generated by the agent, and optionally a known correct "solution diff" and automated test output.
-Your job is to determine if the diff successfully accomplishes the task and explain why (or why not).
-- If automated tests were run and PASSED, the patch is accepted: score 1 with a concise explanation.
-- If automated tests were run and FAILED, the patch did NOT satisfy the acceptance tests: score 0 unless you have a compelling reason the failure is unrelated to the change (e.g. a pre-existing/environment failure), which you must explain in the rationale.
-- If no automated tests were run, judge the diff on its own merits against the expected behavior and the known correct solution.
-Respond ONLY with a JSON object in this exact format, with no markdown wrapping:
-{
-  "score": 0 or 1,
-  "rationale": "Explanation for the score"
-}`;
-
-    let truncatedTestOutput = testOutput;
-    if (truncatedTestOutput.length > 15000) {
-      truncatedTestOutput = truncatedTestOutput.substring(0, 5000) + "\n\n...[TRUNCATED]...\n\n" + truncatedTestOutput.substring(truncatedTestOutput.length - 10000);
-    }
-
-    // Build the test results section for the judge
-    let testResultsSection = "";
-    if (testExitCode !== null) {
-      const testSource = isSweContainer ? "SWE-bench Container" : "Local";
-      testResultsSection = `Automated Test Execution (${testSource}):\nExit Code: ${testExitCode}\nTests: ${isSweContainer && task.failToPass ? task.failToPass.join(", ") : (task.testCommand || "N/A")}\nOutput:\n${truncatedTestOutput}\n`;
-    }
-
-    const judgePrompt = `Task Prompt:
-${task.prompt}
-
-Expected Behavior:
-${task.expectedBehavior || "Not specified."}
-
-${expectedDiff ? `Known Correct Solution Diff:\n${expectedDiff}\n` : ""}
-Agent Diff:
-${diff ? diff : "(No changes made)"}
-
-${testResultsSection}
-`;
-
-    let judgeOutput = "";
+    // Sealed runs (--defer-grading): the score is decided later by
+    // src/grade.ts in a FRESH container, and the judge runs on the host
+    // (scripts/finalize-sealed-result.ts) -- the in-container test above is
+    // advisory only (it feeds the verification retry), and this container
+    // never needs expectedDiff or a judge API key.
     let judgeScore: number | null = null;
-    let rationale = "Failed to parse judge output";
-    let judgeParseFailed = true;
+    let rationale = "";
+    let judgeParseFailed = false;
     let judgeAttemptsUsed = 0;
-    const maxJudgeAttempts = 3;
-    for (let attempt = 1; attempt <= maxJudgeAttempts; attempt++) {
-      judgeAttemptsUsed = attempt;
-      judgeOutput = "";
-      const stream = modelRuntime.streamSimple(judgeModel, {
-        systemPrompt: judgeSystemPrompt,
-        messages: [{ role: "user", content: judgePrompt, timestamp: Date.now() }]
-      }, { apiKey: auth.apiKey, headers: auth.headers });
+    let judgeModel: any = undefined;
+    let scoreSource: string;
+    let finalScore: number | null;
+    if (deferGrading) {
+      console.log(`[INFO] Grading deferred to a fresh container (sealed mode) -- skipping in-container judge.`);
+      scoreSource = "pending-fresh-grade";
+      finalScore = null;
+    } else {
+      console.log(`[INFO] Running LLM judge...`);
+      // The resolved agent model (what the agent session actually uses) is the
+      // judge default here; keep a reference to detect self-grading correctly.
+      judgeModel = resolveJudgeModel(modelRegistry, judgeModelReq, session.state.model as any);
 
-      for await (const chunk of stream) {
-        if (chunk.type === "text_delta") {
-          judgeOutput += chunk.delta;
+      let expectedDiff = task.expectedDiff || "";
+      if (task.solutionCommit) {
+        console.log(`[INFO] Fetching solution commit ${task.solutionCommit} to generate expected diff...`);
+        await execAsync(`git fetch --depth 1 origin ${task.solutionCommit}`, { cwd: tmpDir });
+        try {
+          const { stdout } = await execAsync(`git diff ${task.commit} ${task.solutionCommit}`, { cwd: tmpDir });
+          expectedDiff = stdout;
+        } catch (e) {
+          console.warn(`[WARN] Failed to generate diff for solution commit:`, e);
         }
-        if (chunk.type === "error") {
-          console.error("[DEBUG] streamSimple error:", chunk.error);
-        }
       }
-      const preview = judgeOutput.length > 500 ? judgeOutput.slice(0, 500) + "... [TRUNCATED]" : judgeOutput;
-      console.log(`[DEBUG] Raw judge output (attempt ${attempt}/${maxJudgeAttempts}):`, preview);
 
-      const parsed = parseJudgeOutput(judgeOutput);
-      if (!parsed.parseFailed) {
-        judgeScore = parsed.score;
-        rationale = parsed.rationale;
-        judgeParseFailed = false;
-        break;
-      }
-      console.error(`[ERROR] Failed to parse judge output (attempt ${attempt}/${maxJudgeAttempts}): ${parsed.rationale.slice(0, 300)}`);
-      rationale = parsed.rationale;
-      if (attempt < maxJudgeAttempts) {
-        console.log(`[INFO] Retrying LLM judge...`);
-      }
-    }
+      const judgePrompt = buildJudgePrompt({ task, expectedDiff, diff, testExitCode, testOutput, isSweContainer });
+      ({ judgeScore, rationale, judgeParseFailed, judgeAttemptsUsed } = await runJudge(modelRuntime, modelRegistry, judgeModel, judgePrompt));
 
-    // #1 Ground-truth-first scoring: for SWE-bench container tasks the
-    // FAIL_TO_PASS test result DECIDES the score; the LLM judge only explains
-    // (its raw verdict is recorded as judgeModelScore for later comparison).
-    // For other tasks the judge decides; unparseable judge output defaults to 0.
-    // A harness error (malformed FAIL_TO_PASS -- see task-validation.ts) is
-    // checked FIRST: it also has testExitCode === null, but must never fall
-    // through to the judge, which never saw a real test result either.
-    let scoreSource: "container-test" | "judge" | "judge-parse-failed" | "harness-error" = "judge";
-    let finalScore: number = 0;
-    if (isSweContainer && task.failToPass && task.failToPass.length > 0 && harnessError) {
-      scoreSource = "harness-error";
-      finalScore = 0;
-      console.log(`[INFO] Harness error -- malformed FAIL_TO_PASS data, no test could be run. Excluding ${task.id} from pass-rate.`);
-    } else if (isSweContainer && task.failToPass && task.failToPass.length > 0 && testExitCode !== null) {
-      scoreSource = "container-test";
-      finalScore = testExitCode === 0 ? 1 : 0;
-      if (judgeScore !== null && judgeScore !== finalScore) {
+      const isSweTestTask = isSweContainer && !!task.failToPass && task.failToPass.length > 0;
+      ({ scoreSource, finalScore } = decideScore({ isSweTestTask, harnessError, testExitCode, judgeScore, judgeParseFailed }));
+      if (scoreSource === "harness-error") {
+        console.log(`[INFO] Harness error -- malformed FAIL_TO_PASS data, no test could be run. Excluding ${task.id} from pass-rate.`);
+      } else if (scoreSource === "container-test" && judgeScore !== null && judgeScore !== finalScore) {
         console.log(`[INFO] Judge raw score ${judgeScore} but container test ${testExitCode === 0 ? "PASSED" : "FAILED"} (exit ${testExitCode}) — final score decided by the test.`);
       }
-    } else if (judgeScore !== null && !judgeParseFailed) {
-      scoreSource = "judge";
-      finalScore = judgeScore === 1 ? 1 : 0;
-    } else {
-      scoreSource = "judge-parse-failed";
-      finalScore = 0;
     }
     const result: any = {
       task: task.id,
@@ -905,6 +676,12 @@ ${testResultsSection}
     if (isSweContainer) {
       result.sweContainerTest = true;
       result.sweTestExitCode = testExitCode;
+    }
+    if (deferGrading) {
+      // Advisory only: this ran in the container the agent had root in. The
+      // host replaces testExitCode/testOutput/score with the fresh-container
+      // grade and never trusts any score-bearing field from this file.
+      result.inContainerTestExitCode = testExitCode;
     }
 
     const resultPath = join(outputDir, `results-${task.id}.json`);
@@ -950,8 +727,10 @@ async function main() {
       "inference-profile": { type: "string" },
       "print-output-dir": { type: "boolean" },
       "print-egress-allowlist": { type: "boolean" },
+      "write-gateway-config": { type: "string" },
       "output-dir": { type: "string" },
       "consume-task": { type: "boolean" },
+      "defer-grading": { type: "boolean" },
       "exclude-tools": { type: "string" },
     },
     allowPositionals: true,
@@ -978,7 +757,7 @@ async function main() {
   // console.error, not console.log: --print-output-dir's only stdout contract
   // is the directory path (run-swe-bench.sh captures it via `$(...)`), and
   // this line runs before that check on every invocation.
-  if (excludeTools.length > 0 && !values["print-output-dir"] && !values["print-egress-allowlist"]) {
+  if (excludeTools.length > 0 && !values["print-output-dir"] && !values["print-egress-allowlist"] && !values["write-gateway-config"]) {
     console.error(`[INFO] Excluding tools: ${excludeTools.join(", ")}`);
   }
 
@@ -986,7 +765,7 @@ async function main() {
   const provider = (values.provider || values.engine || "llama.cpp") as string;
 
   const targetPath = positionals[0];
-  if (!targetPath && !values["print-output-dir"] && !values["print-egress-allowlist"]) {
+  if (!targetPath && !values["print-output-dir"] && !values["print-egress-allowlist"] && !values["write-gateway-config"]) {
     console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params] [--exclude-tools web_search,web_fetch|none]");
     process.exit(1);
   }
@@ -1059,31 +838,48 @@ async function main() {
     process.exit(0);
   }
 
-  // Prints the host:port pairs a sealed container must be able to reach:
-  // the agent's and the judge's model endpoints, with localhost mapped to
-  // host.docker.internal. run-swe-bench.sh feeds this to the egress proxy.
-  if (values["print-egress-allowlist"]) {
+  // Sealed-mode network plan for the AGENT model (the judge runs on the host
+  // in sealed mode, so it needs nothing from the container):
+  //  - a local server (llama.cpp/ds4/vllm) -> allow host.docker.internal:<port>
+  //    through the egress proxy (no key involved);
+  //  - a remote API (openrouter, ...) -> NOT allowlisted; reached only via the
+  //    key-holding gateway, so the container never holds the real key.
+  // --print-egress-allowlist prints the CONNECT/HTTP allowlist (may be empty);
+  // --write-gateway-config <path> writes the gateway routes INCLUDING the real
+  // key to <path> (mode 0600) and prints the PI_BENCH_GATEWAY spec.
+  if (values["print-egress-allowlist"] || values["write-gateway-config"]) {
     const localModelsPath = join(process.cwd(), "models.json");
     const runtime = await ModelRuntime.create(existsSync(localModelsPath) ? { modelsPath: localModelsPath } : undefined);
     const registry = new ModelRegistry(runtime);
-    const targets = new Set<string>();
-    const addModel = (req: any, fallbackProvider?: string) => {
-      const m: any = req
-        ? registry.find(req.provider, req.id)
-        : registry.getAll().find((x: any) => x.provider === fallbackProvider);
-      if (!m?.baseUrl) return;
-      let baseUrl: string = m.baseUrl;
-      if (values.port && m.provider === provider) baseUrl = baseUrl.replace(/:\d+/, `:${values.port}`);
-      const t = egressTargetFromBaseUrl(baseUrl, "host.docker.internal");
-      if (t) targets.add(t);
-    };
-    addModel(agentModelReq, provider);
-    // No --judge-model means the judge is the agent model (already added).
-    if (judgeModelReq) addModel(judgeModelReq);
-    if (isLocalProvider && targets.size === 0) {
-      targets.add(`host.docker.internal:${values.port || (provider === "ds4" || provider === "vllm" ? "8000" : "8080")}`);
+    const agentModel: any = agentModelReq
+      ? registry.find(agentModelReq.provider, agentModelReq.id)
+      : registry.getAll().find((x: any) => x.provider === provider);
+    let baseUrl: string | undefined = agentModel?.baseUrl;
+    if (baseUrl && values.port && agentModel.provider === provider) baseUrl = baseUrl.replace(/:\d+/, `:${values.port}`);
+    const localTarget = baseUrl ? egressTargetFromBaseUrl(baseUrl, "host.docker.internal") : null;
+    const isLocalEndpoint = !!localTarget && localTarget.startsWith("host.docker.internal:");
+
+    if (values["print-egress-allowlist"]) {
+      const targets: string[] = [];
+      if (isLocalEndpoint) targets.push(localTarget!);
+      else if (!agentModel && isLocalProvider) {
+        targets.push(`host.docker.internal:${values.port || (provider === "ds4" || provider === "vllm" ? "8000" : "8080")}`);
+      }
+      console.log(targets.join(","));
+      process.exit(0);
     }
-    console.log([...targets].join(","));
+
+    const routes: GatewayRoute[] = [];
+    if (agentModel && baseUrl && !isLocalEndpoint) {
+      const auth: any = await registry.getApiKeyAndHeaders(agentModel);
+      if (!auth.ok || !auth.apiKey) {
+        console.error(`[ERROR] No API key for ${agentModel.provider} -- cannot configure the sealed gateway.`);
+        process.exit(1);
+      }
+      routes.push({ name: agentModel.provider, upstream: baseUrl, key: auth.apiKey, models: [agentModel.id] });
+    }
+    await writeFile(values["write-gateway-config"] as string, JSON.stringify({ routes }, null, 2), { mode: 0o600 });
+    console.log(routes.map((r) => `${r.name}=http://${GATEWAY_HOST}:${GATEWAY_PORT}/${r.name}`).join(","));
     process.exit(0);
   }
 
@@ -1159,7 +955,7 @@ async function main() {
       console.warn(`[WARN] Could not pre-parse task file ${f} for resume check.`);
     }
 
-    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools, !!values["consume-task"]);
+    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools, !!values["consume-task"], !!values["defer-grading"]);
     results.push(res);
     if (res.excludeFromPassRate) harnessErrors++;
     else if (res.judgeScore === 1) passed++;
