@@ -163,6 +163,26 @@ After the agent finishes editing code, the runner:
 4. **The LLM Judge** receives both the diff and the test results and provides a human-readable rationale explaining *why* the fix worked or didn't. Its raw verdict is preserved separately as `judgeModelScore` (useful for measuring judge/test agreement over time), even when it's overridden by the test result. The judge call is retried up to 3 times on unparseable output before falling back to the test result.
 5. If the judge and agent are configured to the same model, the run logs a `[WARN] Judge model is the SAME as the agent model` notice — worth knowing, though it no longer affects the score for container tasks since the test decides it.
 
+#### Sealed mode (anti-cheat, on by default)
+With open network access, agents were observed fetching the real upstream fix instead of solving the task: `pip download sphinx==8.0.2 --no-binary :all:`, `curl https://raw.githubusercontent.com/<repo>/<later tag>/...`, Python `urllib` against `api.github.com/search/issues` to find the fixing PR. `bun run scripts/audit-egress.ts` found this in 12–19 of 50 tasks in each `deepseek-v4-flash-0731` run, most of them scored as passes. Separately, with the whole repo bind-mounted, every task's gold patch (`tasks/*.json` → `expectedDiff`) was one `cat` away.
+
+`run-swe-bench.sh` therefore runs every task **sealed**:
+
+1. **No route out.** The task container joins an `--internal` docker network (`pi-bench-sealed`). Its only egress is the `pi-bench-egress` proxy container (`scripts/egress-proxy.ts`). The proxy allows exactly the agent's and judge's LLM endpoints, as printed by `src/index.ts --print-egress-allowlist`, with `localhost` mapped to `host.docker.internal`. Everything else gets HTTP 403: pip, git, curl, Python, subagents, and in-process extension tools alike. Unsetting the proxy env doesn't help, because the container has no DNS and no route.
+2. **Tamper-proof evidence.** After each task, the proxy's own log for that task's time window is folded into the result as `egressDeniedByProxy` and `egressDeniedTargets`. The harness also records `egressAttemptCount`, `egressAttempts` and `contaminationSuspected` from the agent's bash commands, and `sealedNetwork: true`.
+3. **No answers in the container.** Only `src/`, `node_modules/` and the manifest/`models.json` files are mounted, read-only. The task JSON is copied into a per-task staging dir, and the harness deletes it (`--consume-task`) before the agent starts. Results are written to the staging dir (`--output-dir`) and then moved into `benchmark_results/`, so the agent never sees earlier attempts' hidden-test output.
+4. **Toolchain prepared once.** Sealed containers can't `apt-get` or `curl`. So `bun`, `rg`, `fd` and `node_modules` are installed once, with network, into the `pi-bench-bun-cache` volume before the first task. `PI_OFFLINE=1` stops pi from trying to download them itself.
+
+`PI_BENCH_EGRESS_ALLOW=host:port,...` overrides the computed allowlist. `--unsealed` restores the old behavior (`--network host`, whole repo mounted read-write). Use it only for debugging the harness: unsealed results aren't comparable to sealed ones.
+
+To check existing (unsealed) runs for contamination:
+```bash
+bun run scripts/audit-egress.ts benchmark_results          # per-run table + contaminated passes
+bun run scripts/audit-egress.ts benchmark_results --mark   # also write the egress fields into results-*.json
+```
+
+Known residual risk: the agent can still reach the allowlisted LLM API itself, since the API key is in the container's environment. The command detector flags this as `http-fetch`.
+
 This combines the objectivity of SWE-bench's test-based evaluation with the explainability of an LLM judge. Each result JSON also records `scoreSource` (`"container-test"` | `"judge"` | `"judge-parse-failed"`), `judgeParseFailed`, `judgeAttempts`, `judgeModel`, `timedOut`, `loopRecoveries` (how many times the agent got stuck in a tool-call loop and had to be redirected), `verificationRetries` (`1` if the fix failed the real `FAIL_TO_PASS` tests and the agent was given its one corrective pass with the actual failure output, otherwise `0`), and `archaeologyNudges` (how many times the agent was nudged out of a git-history exploration streak with no file edits, capped at 2 per task) for later analysis.
 
 ### Curated Tasks (Docker sandbox)
@@ -212,6 +232,10 @@ bun run src/index.ts tasks/curated/easy.json
 | `--context <tokens>` | Override model context window size for this run | From `models.json` |
 | `--timeout <minutes>` | Agent timeout per task | `30` |
 | `--pass <N>` | Number of attempts to make per task (retries on failure) | `1` |
+| `--unsealed` | `run-swe-bench.sh` only: disable sealed mode (agent gets internet + the repo mount). Debugging only | sealed |
+| `--output-dir <dir>` | Write results here instead of the computed `benchmark_results/...` dir | computed |
+| `--consume-task` | Delete the task file right after reading it (used by sealed mode) | off |
+| `--print-egress-allowlist` | Print the `host:port` LLM endpoints a sealed container must reach, then exit | — |
 | `--exclude-tools <list\|none>` | Comma-separated tool names to disable, or `none` to allow everything | `web_search,web_fetch,question,questionnaire` |
 
 `--exclude-tools` defaults to disabling `web_search` and `web_fetch` (if your `~/.pi/agent` extensions register them) so the agent can't look up the real upstream fix online instead of solving the task, and `question`/`questionnaire` since no human is ever attached to a benchmark run — they fail cleanly rather than hang, but there's no reason to let a task burn a turn reaching for one — pass `--exclude-tools none` to allow all tools, or your own comma-separated list to disable a different set.

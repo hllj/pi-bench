@@ -17,6 +17,13 @@ import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } fr
 import { extractDjangoTestModules, validateFailToPass } from "./task-validation";
 import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from "./config-guard";
 import { scrubGitHistoryToOrphanBaseline } from "./git-scrub";
+import { detectEgressAttempt, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type EgressAttempt } from "./egress";
+
+// Hostname that reaches the machine running the local inference server. A
+// sealed SWE container (run-swe-bench.sh) has no route to the host's
+// loopback, so it sets this to host.docker.internal and all localhost model
+// URLs are rewritten to go through the egress proxy.
+const LOCAL_HOST = process.env.PI_BENCH_LOCAL_HOST || "localhost";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -158,9 +165,17 @@ async function runSweBenchTestCommand(tmpDir: string, task: any): Promise<{ test
   }
 }
 
-async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[]) {
+async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[], consumeTask = false) {
   const taskContent = await readFile(taskFile, "utf-8");
   const task = JSON.parse(taskContent);
+  if (consumeTask) {
+    // The task file carries the answer (expectedDiff = the gold patch,
+    // testPatch = the hidden acceptance tests). In sealed mode it's a
+    // per-task staged copy; delete it before the agent gets a shell so the
+    // only copy left is in this process's memory.
+    await rm(taskFile, { force: true });
+    console.log(`[INFO] Consumed staged task file ${taskFile} (removed before agent start).`);
+  }
 
   console.log(`\n======================================================`);
   console.log(`[INFO] Starting benchmark for task file: ${taskFile}`);
@@ -212,11 +227,14 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     let modelsPath: string | undefined;
     if (existsSync(localModelsPath)) {
       console.log(`[INFO] Using local models.json configuration`);
-      if (port) {
+      if (port || LOCAL_HOST !== "localhost") {
         const modelsContent = await readFile(localModelsPath, "utf-8");
         const modelsData = JSON.parse(modelsContent);
-        if (modelsData.providers && modelsData.providers[provider] && modelsData.providers[provider].baseUrl) {
+        if (port && modelsData.providers && modelsData.providers[provider] && modelsData.providers[provider].baseUrl) {
           modelsData.providers[provider].baseUrl = modelsData.providers[provider].baseUrl.replace(/:\d+/, `:${port}`);
+        }
+        for (const p of Object.values<any>(modelsData.providers || {})) {
+          if (p && typeof p.baseUrl === "string") p.baseUrl = rewriteLocalBaseUrl(p.baseUrl, LOCAL_HOST);
         }
         const tmpModelsPath = tmpDir + "-models.json";
         await writeFile(tmpModelsPath, JSON.stringify(modelsData));
@@ -229,7 +247,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         const modelsData = {
           providers: {
             [provider]: {
-              baseUrl: `http://localhost:${port}/v1`,
+              baseUrl: `http://${LOCAL_HOST}:${port}/v1`,
               api: "openai-completions",
               apiKey: "none",
               models: [{ id: "local-model", contextWindow: contextWindowOverride || 128000, maxTokens: 65536 }]
@@ -315,6 +333,14 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     // session.prompt() runs further down -- by then both are set.
     let budgetNudgeNeeded = false;
     let budgetNudgeIssued = false;
+
+    // Audit trail of network-fetch attempts (pip download, git clone, curl
+    // github/pypi, ...). Enforcement is the sealed network, not this -- see
+    // src/egress.ts -- but a result that passed while the agent was reaching
+    // for upstream sources must be visible in the JSON, not just the logs.
+    const egressAttempts: EgressAttempt[] = [];
+    const MAX_RECORDED_EGRESS_ATTEMPTS = 20;
+    let egressAttemptCount = 0;
     const start = Date.now();
     const timeoutMs = timeoutMin * 60 * 1000;
 
@@ -376,6 +402,13 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
             console.warn(`\n[WARN] 50% of the ${timeoutMin}-minute time budget used. Nudging agent to focus on finishing.`);
             budgetNudgeNeeded = true;
             session.abort();
+          }
+
+          const egressAttempt = detectEgressAttempt(event.toolName, event.args);
+          if (egressAttempt) {
+            egressAttemptCount++;
+            if (egressAttempts.length < MAX_RECORDED_EGRESS_ATTEMPTS) egressAttempts.push(egressAttempt);
+            console.warn(`\n[WARN] Network-fetch attempt (${egressAttempt.category}): ${egressAttempt.snippet.slice(0, 120)}`);
           }
 
           if (argsStr.length > 200) argsStr = argsStr.substring(0, 200) + "...";
@@ -860,6 +893,14 @@ ${testResultsSection}
       verificationRetries,
       archaeologyNudges: archaeologyNudgesUsed,
       timeBudgetNudged: budgetNudgeIssued,
+      egressAttemptCount,
+      egressAttempts,
+      // True when the agent tried to pull upstream source/history. Under the
+      // sealed network these attempts fail, so this is informational; on an
+      // --unsealed run a passing result with this set should be treated as
+      // contaminated.
+      contaminationSuspected: egressAttempts.some((a) => a.category === "upstream-source"),
+      sealedNetwork: process.env.PI_BENCH_SEALED === "1",
     };
     if (isSweContainer) {
       result.sweContainerTest = true;
@@ -908,6 +949,9 @@ async function main() {
       port: { type: "string" },
       "inference-profile": { type: "string" },
       "print-output-dir": { type: "boolean" },
+      "print-egress-allowlist": { type: "boolean" },
+      "output-dir": { type: "string" },
+      "consume-task": { type: "boolean" },
       "exclude-tools": { type: "string" },
     },
     allowPositionals: true,
@@ -934,7 +978,7 @@ async function main() {
   // console.error, not console.log: --print-output-dir's only stdout contract
   // is the directory path (run-swe-bench.sh captures it via `$(...)`), and
   // this line runs before that check on every invocation.
-  if (excludeTools.length > 0 && !values["print-output-dir"]) {
+  if (excludeTools.length > 0 && !values["print-output-dir"] && !values["print-egress-allowlist"]) {
     console.error(`[INFO] Excluding tools: ${excludeTools.join(", ")}`);
   }
 
@@ -942,7 +986,7 @@ async function main() {
   const provider = (values.provider || values.engine || "llama.cpp") as string;
 
   const targetPath = positionals[0];
-  if (!targetPath && !values["print-output-dir"]) {
+  if (!targetPath && !values["print-output-dir"] && !values["print-egress-allowlist"]) {
     console.error("Usage: bun run src/index.ts <task-file-or-dir> [--provider llama.cpp|ds4|openrouter] [--model model-id] [--judge-model provider/model-id] [--model-tag tag] [--platform platform-id] [--rocm-version 7.2.4] [--port 8080] [--context tokens] [--inference-profile params] [--exclude-tools web_search,web_fetch|none]");
     process.exit(1);
   }
@@ -976,7 +1020,7 @@ async function main() {
   if (isLocalProvider) {
     try {
       const fetchPort = values.port || (provider === "ds4" || provider === "vllm" ? "8000" : "8080");
-      const res = await fetch(`http://localhost:${fetchPort}/v1/models`);
+      const res = await fetch(`http://${LOCAL_HOST}:${fetchPort}/v1/models`);
       const data = await res.json();
       if (data && data.data && data.data.length > 0) {
         exactModelId = data.data[0].id;
@@ -1003,8 +1047,43 @@ async function main() {
     outputDir = join("benchmark_results", values.platform as string, outputDir);
   }
 
+  // Explicit override: sealed runs write into a per-task staging directory
+  // (not the shared results dir, which holds earlier attempts' hidden-test
+  // output) and the host moves the files into place afterwards.
+  if (values["output-dir"]) {
+    outputDir = values["output-dir"] as string;
+  }
+
   if (values["print-output-dir"]) {
     console.log(outputDir);
+    process.exit(0);
+  }
+
+  // Prints the host:port pairs a sealed container must be able to reach:
+  // the agent's and the judge's model endpoints, with localhost mapped to
+  // host.docker.internal. run-swe-bench.sh feeds this to the egress proxy.
+  if (values["print-egress-allowlist"]) {
+    const localModelsPath = join(process.cwd(), "models.json");
+    const runtime = await ModelRuntime.create(existsSync(localModelsPath) ? { modelsPath: localModelsPath } : undefined);
+    const registry = new ModelRegistry(runtime);
+    const targets = new Set<string>();
+    const addModel = (req: any, fallbackProvider?: string) => {
+      const m: any = req
+        ? registry.find(req.provider, req.id)
+        : registry.getAll().find((x: any) => x.provider === fallbackProvider);
+      if (!m?.baseUrl) return;
+      let baseUrl: string = m.baseUrl;
+      if (values.port && m.provider === provider) baseUrl = baseUrl.replace(/:\d+/, `:${values.port}`);
+      const t = egressTargetFromBaseUrl(baseUrl, "host.docker.internal");
+      if (t) targets.add(t);
+    };
+    addModel(agentModelReq, provider);
+    // No --judge-model means the judge is the agent model (already added).
+    if (judgeModelReq) addModel(judgeModelReq);
+    if (isLocalProvider && targets.size === 0) {
+      targets.add(`host.docker.internal:${values.port || (provider === "ds4" || provider === "vllm" ? "8000" : "8080")}`);
+    }
+    console.log([...targets].join(","));
     process.exit(0);
   }
 
@@ -1080,7 +1159,7 @@ async function main() {
       console.warn(`[WARN] Could not pre-parse task file ${f} for resume check.`);
     }
 
-    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools);
+    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools, !!values["consume-task"]);
     results.push(res);
     if (res.excludeFromPassRate) harnessErrors++;
     else if (res.judgeScore === 1) passed++;

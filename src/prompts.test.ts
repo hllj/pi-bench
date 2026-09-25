@@ -28,6 +28,13 @@ describe("buildSweEnvInstruction", () => {
     expect(instr).toContain("INFINITE LOOP PREVENTION");
     expect(instr).toContain("Unnecessary git archaeology");
   });
+
+  test("tells the agent there is no internet and not to fetch upstream sources", () => {
+    const instr = buildSweEnvInstruction(true);
+    expect(instr).toContain("NO INTERNET ACCESS");
+    expect(instr).toContain("pip download");
+    expect(instr.toLowerCase()).toContain("upstream");
+  });
 });
 
 describe("buildAgentPrompt", () => {
