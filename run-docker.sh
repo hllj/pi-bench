@@ -19,11 +19,21 @@ docker build -t pi-bench-runner .
 # have npm on PATH, so without this mount that install crashes the run.
 AGENT_DIR="$HOME/.pi/agent"
 RESOURCE_MOUNTS=""
-for name in extensions skills prompts agents settings.json AGENTS.md npm; do
+for name in extensions skills prompts settings.json AGENTS.md npm; do
     if [ -e "$AGENT_DIR/$name" ]; then
         RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $AGENT_DIR/$name:/root/.pi/agent/$name:ro"
     fi
 done
+
+# Subagent definitions: a staged copy with `model:` overrides dropped and
+# --exclude-tools applied (same as run-swe-bench.sh; see src/subagent-support.ts).
+if [ -d "$AGENT_DIR/agents" ]; then
+    STAGED_AGENTS_DIR="$(pwd)/.pi-bench-stage/agents-$$"
+    trap 'rm -rf "$STAGED_AGENTS_DIR"' EXIT
+    EXCLUDED_TOOLS=$(bun run src/index.ts --print-excluded-tools "$@" 2>/dev/null || true)
+    bun run scripts/stage-agents.ts "$AGENT_DIR/agents" "$STAGED_AGENTS_DIR" "$EXCLUDED_TOOLS"
+    RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $STAGED_AGENTS_DIR:/root/.pi/agent/agents:ro"
+fi
 
 # ~/.pi/agent/extensions is commonly a symlink into a separate config repo
 # (e.g. ~/pi-config). A bind mount doesn't rewrite symlink targets, so mount

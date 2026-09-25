@@ -24,7 +24,7 @@ export function buildAgentPrompt({ tmpDir, isSweContainer, taskPrompt }: AgentPr
 CRITICAL INSTRUCTIONS:
 1. Do NOT use \`git clone\` or download any repositories. The code is already here.
 2. ALL your work (fixes and tests) must be done STRICTLY within your current working directory. Use relative paths (e.g., \`.\`) instead of absolute paths.
-3. Do NOT explore, read, or modify files outside of your current working directory.
+3. Do NOT explore, read, or modify files outside of your current working directory. One exception: your own pi configuration under \`~/.pi/agent\` (skills, agent definitions, instruction files) is yours to read whenever your instructions call for it, and using skills and subagents is allowed.
 4. Focus only on fixing the issue described below and verifying your fix with tests.
 5. You are running completely autonomously. There is NO human interaction. You must independently investigate, write the fix, verify it, and then STOP calling tools when you are done.
 6. You are to complete the task and produce changes editing the files in this project. Do not stop without editing the files required to complete the task!

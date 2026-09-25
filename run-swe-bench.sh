@@ -12,7 +12,8 @@ set -e
 #   1. Iterates over task files in the given directory (or runs a single task file)
 #   2. For each task, launches the corresponding SWE-bench container
 #   3. Installs bun + pi-bench deps inside the container (cached via Docker volume)
-#   4. Mounts your ~/.pi/agent extensions/skills/prompts/settings.json read-only
+#   4. Mounts your ~/.pi/agent extensions/skills/prompts/settings.json read-only,
+#      plus a staged copy of agents/ (see scripts/stage-agents.ts)
 #      (see the RESOURCE_MOUNTS block below) -- auth.json/sessions/models-store.json
 #      are NOT mounted, so model/judge credentials still come from .env
 #   5. Commits a benchmark-baseline in /testbed before the agent runs, so the
@@ -74,11 +75,25 @@ docker volume create pi-bench-bun-cache 2>/dev/null || true
 # have npm on PATH, so without this mount that install crashes the run.
 AGENT_DIR="$HOME/.pi/agent"
 RESOURCE_MOUNTS=""
-for name in extensions skills prompts agents settings.json AGENTS.md npm; do
+for name in extensions skills prompts settings.json AGENTS.md npm; do
   if [ -e "$AGENT_DIR/$name" ]; then
     RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $AGENT_DIR/$name:/root/.pi/agent/$name:ro"
   fi
 done
+
+# Subagent definitions are mounted as a staged copy, not as-is: `model:`
+# overrides dropped (children inherit the benchmarked model -- the sealed
+# gateway forwards nothing else) and --exclude-tools applied to their `tools:`
+# lists (the parent's exclusions don't reach child processes). Per-run dir so
+# concurrent runs don't clobber each other. See src/subagent-support.ts.
+STAGED_AGENTS_DIR=""
+if [ -d "$AGENT_DIR/agents" ]; then
+  STAGED_AGENTS_DIR="$PI_BENCH_DIR/.pi-bench-stage/agents-$$"
+  trap 'rm -rf "$STAGED_AGENTS_DIR"' EXIT
+  EXCLUDED_TOOLS=$(bun run src/index.ts --print-excluded-tools $EXTRA_ARGS 2>/dev/null || true)
+  bun run scripts/stage-agents.ts "$AGENT_DIR/agents" "$STAGED_AGENTS_DIR" "$EXCLUDED_TOOLS"
+  RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $STAGED_AGENTS_DIR:/root/.pi/agent/agents:ro"
+fi
 
 # ~/.pi/agent/extensions is commonly a symlink into a separate config repo
 # (e.g. ~/pi-config). A bind mount doesn't rewrite symlink targets, so mount
@@ -212,7 +227,7 @@ if [ "$SEALED" = "1" ]; then
     -w /proxy \
     oven/bun:latest bun run scripts/egress-proxy.ts >/dev/null
   docker network connect "$SEALED_NETWORK" "$EGRESS_CONTAINER"
-  trap 'docker rm -f "$EGRESS_CONTAINER" >/dev/null 2>&1 || true; rm -f "$GATEWAY_CONFIG_FILE"' EXIT
+  trap 'docker rm -f "$EGRESS_CONTAINER" >/dev/null 2>&1 || true; rm -f "$GATEWAY_CONFIG_FILE"; [ -n "$STAGED_AGENTS_DIR" ] && rm -rf "$STAGED_AGENTS_DIR"' EXIT
 
   # One-time toolchain prep, WITH network, inside the first task's image so
   # the binaries match its arch/libc. Idempotent: skips whatever the

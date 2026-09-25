@@ -73,4 +73,10 @@ describe("mergeSealedResult", () => {
     expect(r.egressDeniedTargets).toEqual(["example.com:80", "pypi.org:443"]);
     expect(r.contaminationSuspected).toBe(true);
   });
+  test("skill/delegation telemetry is carried over type-checked", () => {
+    const untrusted = { diff: "d", skillsRead: ["dev-workflows", 42], delegationCalls: { subagent: 2, run_dev_workflow: "x" } };
+    const r = mergeSealedResult({ taskId: "t1", untrusted, grade: passGrade, judge, egress: { denied: [] } });
+    expect(r.skillsRead).toEqual(["dev-workflows"]);
+    expect(r.delegationCalls).toEqual({ subagent: 2 });
+  });
 });
