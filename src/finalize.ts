@@ -14,8 +14,9 @@ import { decideScore } from "./judge-run";
 // Package indexes (pypi.org, files.pythonhosted.org) are deliberately absent:
 // every `pip install`, pip's own version check and pi-lens's tool installer
 // hit them, so a denial there says nothing about the agent fetching upstream
-// source. An agent's `pip download <repo-package>` is still caught at the
-// command level (egressAttempts category "upstream-source", src/egress.ts).
+// source. A `pip download <repo-package>` is still caught at the command
+// level (egressAttempts category "upstream-source", src/egress.ts) -- from
+// the agent and, via the delegation tool's result, from its subagents.
 const SOURCE_HOST_RE = /(^|\.)(github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|readthedocs\.(io|org)):\d+$/i;
 
 const NUMBER_FIELDS = ["durationMs", "loopRecoveries", "verificationRetries", "archaeologyNudges", "egressAttemptCount"];
@@ -51,7 +52,11 @@ export function mergeSealedResult({ taskId, untrusted, grade, judge, egress }: M
     ? u.egressAttempts
         .filter((a: any) => a && typeof a.category === "string" && typeof a.snippet === "string")
         .slice(0, 20)
-        .map((a: any) => ({ category: a.category, snippet: a.snippet.slice(0, 300) }))
+        .map((a: any) => ({
+          category: a.category,
+          snippet: a.snippet.slice(0, 300),
+          ...(typeof a.via === "string" ? { via: a.via.slice(0, 100) } : {}),
+        }))
     : [];
   result.egressAttempts = attempts;
   // Skill/delegation telemetry (src/subagent-support.ts). Informational only.

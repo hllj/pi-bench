@@ -86,6 +86,13 @@ describe("mergeSealedResult", () => {
     const r = mergeSealedResult({ taskId: "t1", untrusted, grade: passGrade, judge, egress: { denied: ["pypi.org:443"] } });
     expect(r.contaminationSuspected).toBe(true);
   });
+  test("a subagent's upstream-source attempt marks contamination and keeps its origin", () => {
+    const untrusted = { egressAttempts: [{ category: "upstream-source", snippet: "pip download sphinx==4.1.0", via: "subagent:reviewer" }] };
+    const r = mergeSealedResult({ taskId: "t1", untrusted, grade: passGrade, judge, egress: { denied: ["pypi.org:443"] } });
+    expect(r.contaminationSuspected).toBe(true);
+    expect(r.egressAttempts[0].via).toBe("subagent:reviewer");
+  });
+
   test("skill/delegation telemetry is carried over type-checked", () => {
     const untrusted = { diff: "d", skillsRead: ["dev-workflows", 42], delegationCalls: { subagent: 2, run_dev_workflow: "x" } };
     const r = mergeSealedResult({ taskId: "t1", untrusted, grade: passGrade, judge, egress: { denied: [] } });

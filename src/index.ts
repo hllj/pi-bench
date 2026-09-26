@@ -18,7 +18,7 @@ import { extractDjangoTestModules, validateFailToPass } from "./task-validation"
 import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from "./config-guard";
 import { scrubGitHistoryToOrphanBaseline } from "./git-scrub";
 import { applySweTestPatch, revertAgentTestModifications, revertAndApplySweTestPatch, runSweBenchTestCommand } from "./swe-tests";
-import { detectEgressAttempt, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type EgressAttempt } from "./egress";
+import { detectEgressAttempt, detectEgressAttemptsInDelegation, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type EgressAttempt } from "./egress";
 import { childModelsTarget, delegationKind, skillReadName } from "./subagent-support";
 import { applyGatewayOverrides, GATEWAY_HOST, GATEWAY_PORT, parseGatewaySpec, type GatewayRoute } from "./gateway";
 
@@ -245,6 +245,12 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     const egressAttempts: EgressAttempt[] = [];
     const MAX_RECORDED_EGRESS_ATTEMPTS = 20;
     let egressAttemptCount = 0;
+    const recordEgressAttempt = (attempt: EgressAttempt) => {
+      egressAttemptCount++;
+      if (egressAttempts.length < MAX_RECORDED_EGRESS_ATTEMPTS) egressAttempts.push(attempt);
+      const origin = attempt.via ? ` via ${attempt.via}` : "";
+      console.warn(`\n[WARN] Network-fetch attempt (${attempt.category})${origin}: ${attempt.snippet.slice(0, 120)}`);
+    };
     const start = Date.now();
     const timeoutMs = timeoutMin * 60 * 1000;
 
@@ -320,17 +326,21 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
           }
 
           const egressAttempt = detectEgressAttempt(event.toolName, event.args);
-          if (egressAttempt) {
-            egressAttemptCount++;
-            if (egressAttempts.length < MAX_RECORDED_EGRESS_ATTEMPTS) egressAttempts.push(egressAttempt);
-            console.warn(`\n[WARN] Network-fetch attempt (${egressAttempt.category}): ${egressAttempt.snippet.slice(0, 120)}`);
-          }
+          if (egressAttempt) recordEgressAttempt(egressAttempt);
 
           if (argsStr.length > 200) argsStr = argsStr.substring(0, 200) + "...";
         } catch (e) { }
         console.log(`\n[AGENT] Started using tool: ${event.toolName} with args: ${argsStr}`);
       } else if (event.type === "tool_execution_end") {
         console.log(`[AGENT] Finished tool: ${event.toolName}`);
+        // A delegated child's tool calls only become visible here, in the
+        // delegation tool's result details (see src/egress.ts).
+        const delegation = delegationKind(event.toolName);
+        if (delegation) {
+          try {
+            for (const a of detectEgressAttemptsInDelegation((event.result as any)?.details, delegation)) recordEgressAttempt(a);
+          } catch (e) { }
+        }
         if (event.result) {
           try {
             let resStr = typeof event.result === 'string' ? event.result : JSON.stringify(event.result);

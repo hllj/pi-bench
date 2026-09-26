@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   detectEgressAttempt,
+  detectEgressAttemptsInDelegation,
   egressTargetFromBaseUrl,
   isEgressAllowed,
   parseEgressAllowlist,
@@ -124,5 +125,64 @@ describe("detectEgressAttempt", () => {
   test("snippet is truncated", () => {
     const a = detectEgressAttempt("bash", { command: "pip download foo " + "x".repeat(1000) });
     expect(a!.snippet.length).toBeLessThanOrEqual(300);
+  });
+
+  test("run_test commands are checked like bash", () => {
+    expect(detectEgressAttempt("run_test", { command: "pip download django==3.2 --no-deps -d /tmp/dj", timeoutMs: 1000 })?.category).toBe("upstream-source");
+    expect(detectEgressAttempt("run_test", { command: "cd /testbed && python -m pytest tests/ -q" })).toBeNull();
+  });
+});
+
+describe("detectEgressAttemptsInDelegation", () => {
+  const assistant = (calls: Array<[string, any]>) => ({
+    role: "assistant",
+    content: [{ type: "thinking", thinking: "x" }, ...calls.map(([name, args], i) => ({ type: "toolCall", id: `c${i}`, name, arguments: args }))],
+  });
+
+  test("finds a subagent child's upstream fetch and tags it with the agent", () => {
+    const details = {
+      mode: "single",
+      results: [
+        {
+          agent: "reviewer",
+          messages: [
+            { role: "user", content: [{ type: "text", text: "Review: pip download sphinx==4.1.0 is forbidden" }] },
+            assistant([["bash", { command: "git diff" }]]),
+            assistant([["bash", { command: "pip download sphinx==4.1.0 --no-deps -d /tmp/x" }]]),
+            { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "ERROR: 403 curl https://github.com/x" }] },
+          ],
+        },
+      ],
+    };
+    const found = detectEgressAttemptsInDelegation(details, "subagent");
+    expect(found).toHaveLength(1);
+    expect(found[0].category).toBe("upstream-source");
+    expect(found[0].via).toBe("subagent:reviewer");
+  });
+
+  test("walks nested delegation (a child that itself ran a subagent)", () => {
+    const details = {
+      results: [
+        {
+          agent: "planner",
+          messages: [
+            assistant([["subagent", { agent: "scout", task: "t" }]]),
+            {
+              role: "toolResult",
+              toolName: "subagent",
+              details: { results: [{ agent: "scout", messages: [assistant([["run_test", { command: "curl -s https://raw.githubusercontent.com/django/django/main/x.py" }]])] }] },
+            },
+          ],
+        },
+      ],
+    };
+    const found = detectEgressAttemptsInDelegation(details, "subagent");
+    expect(found.map((a) => a.via)).toEqual(["subagent:scout"]);
+  });
+
+  test("tolerates missing or malformed details", () => {
+    expect(detectEgressAttemptsInDelegation(undefined, "subagent")).toEqual([]);
+    expect(detectEgressAttemptsInDelegation({ results: "nope" }, "subagent")).toEqual([]);
+    expect(detectEgressAttemptsInDelegation({ results: [{ agent: "a", messages: [assistant([["edit", { path: "x", edits: [] }]])] }] }, "subagent")).toEqual([]);
   });
 });
