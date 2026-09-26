@@ -11,7 +11,12 @@ import { decideScore } from "./judge-run";
 // pass-rate exclusion come exclusively from the fresh-container grade
 // (src/grade.ts), and egress evidence from the proxy's own log.
 
-const SOURCE_HOST_RE = /(^|\.)(github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|pypi\.org|pythonhosted\.org|readthedocs\.(io|org)):\d+$/i;
+// Package indexes (pypi.org, files.pythonhosted.org) are deliberately absent:
+// every `pip install`, pip's own version check and pi-lens's tool installer
+// hit them, so a denial there says nothing about the agent fetching upstream
+// source. An agent's `pip download <repo-package>` is still caught at the
+// command level (egressAttempts category "upstream-source", src/egress.ts).
+const SOURCE_HOST_RE = /(^|\.)(github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|readthedocs\.(io|org)):\d+$/i;
 
 const NUMBER_FIELDS = ["durationMs", "loopRecoveries", "verificationRetries", "archaeologyNudges", "egressAttemptCount"];
 const BOOLEAN_FIELDS = ["timedOut", "timeBudgetNudged"];

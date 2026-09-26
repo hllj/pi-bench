@@ -179,8 +179,10 @@ echo "========================================================"
 #      `--network none` (src/grade.ts): only the agent's diff is applied, then
 #      the hidden tests run. The judge runs on this host, and
 #      scripts/finalize-sealed-result.ts writes the authoritative result.
-#   5. Toolchain (bun, rg, fd, node_modules) is prepared ONCE up front with
-#      network access, into the shared bun-cache volume.
+#   5. Toolchain (bun, rg, fd, node_modules, and pi-lens's node + pyright +
+#      ruff) is prepared ONCE up front with network access, into the shared
+#      bun-cache volume. pi-lens's own installer is off in the container
+#      (PI_LENS_DISABLE_TOOL_INSTALL=1): it finds those tools on PATH instead.
 # ---------------------------------------------------------------------------
 SEALED_NETWORK="pi-bench-sealed"
 EGRESS_CONTAINER="pi-bench-egress"
@@ -235,7 +237,7 @@ if [ "$SEALED" = "1" ]; then
   # the binaries match its arch/libc. Idempotent: skips whatever the
   # bun-cache volume already has.
   FIRST_TASK_ID=$(python3 -c "import json; print(json.load(open('${TASK_FILES[0]}'))['id'])")
-  echo "[INFO] Preparing sealed toolchain (bun, rg, fd, node_modules) in ${REGISTRY}.${FIRST_TASK_ID} ..."
+  echo "[INFO] Preparing sealed toolchain (bun, rg, fd, node_modules, pi-lens tools) in ${REGISTRY}.${FIRST_TASK_ID} ..."
   docker run --rm \
     -v "$PI_BENCH_DIR:/pi-bench:z" \
     -v "pi-bench-bun-cache:/root/.bun" \
@@ -260,6 +262,32 @@ if [ "$SEALED" = "1" ]; then
       fi
       cd /pi-bench && (bun install --frozen-lockfile 2>/dev/null || bun install 2>/dev/null)
       echo "[SETUP] toolchain ready: $(bun --version), $(rg --version | head -1), $(fd --version)"
+
+      # pi-lens Python tooling. Sealed runs set PI_LENS_DISABLE_TOOL_INSTALL=1
+      # (its installer would otherwise retry pypi.org through the proxy for
+      # minutes per task), so the LSP only works if it is already on PATH:
+      # pyright-langserver (needs node -- the task images have none) and ruff.
+      # Only lens/bin goes on the agent PATH: node, not npm.
+      LENS=/root/.bun/lens
+      mkdir -p $LENS/bin
+      case $ARCH in x86_64) NODE_ARCH=x64 ;; aarch64) NODE_ARCH=arm64 ;; *) NODE_ARCH=$ARCH ;; esac
+      if [ ! -x $LENS/node/bin/node ]; then
+        curl -fsSL "https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-${NODE_ARCH}.tar.gz" | tar -xz -C /tmp
+        rm -rf $LENS/node && mv /tmp/node-v22.12.0-linux-${NODE_ARCH} $LENS/node
+      fi
+      if [ ! -e $LENS/pyright/node_modules/.bin/pyright-langserver ]; then
+        PATH=$LENS/node/bin:$PATH npm install --prefix $LENS/pyright --no-audit --no-fund --silent pyright@1.1.390
+      fi
+      if [ ! -x $LENS/ruff/ruff ]; then
+        mkdir -p $LENS/ruff
+        curl -fsSL "https://github.com/astral-sh/ruff/releases/download/0.8.4/ruff-${ARCH}-unknown-linux-musl.tar.gz" \
+          | tar -xz -C /tmp && cp /tmp/ruff-${ARCH}-unknown-linux-musl/ruff $LENS/ruff/ruff
+      fi
+      ln -sfn ../node/bin/node $LENS/bin/node
+      ln -sfn ../pyright/node_modules/.bin/pyright $LENS/bin/pyright
+      ln -sfn ../pyright/node_modules/.bin/pyright-langserver $LENS/bin/pyright-langserver
+      ln -sfn ../ruff/ruff $LENS/bin/ruff
+      echo "[SETUP] pi-lens tools ready: node $($LENS/bin/node --version), $(PATH=$LENS/bin:$PATH pyright --version), $($LENS/bin/ruff --version)"
     '
 fi
 
@@ -320,6 +348,7 @@ json.dump(t, open(sys.argv[2], 'w'))
         -e PI_BENCH_LOCAL_HOST=host.docker.internal \
         -e PI_BENCH_GATEWAY="$GATEWAY_SPEC" \
         -e PI_OFFLINE=1 \
+        -e PI_LENS_DISABLE_TOOL_INSTALL=1 \
         -e HTTP_PROXY="$EGRESS_PROXY_URL" -e HTTPS_PROXY="$EGRESS_PROXY_URL" \
         -e http_proxy="$EGRESS_PROXY_URL" -e https_proxy="$EGRESS_PROXY_URL" \
         -e NO_PROXY="localhost,127.0.0.1,$EGRESS_CONTAINER" -e no_proxy="localhost,127.0.0.1,$EGRESS_CONTAINER" \
@@ -332,9 +361,12 @@ json.dump(t, open(sys.argv[2], 'w'))
         "$IMAGE" \
         bash -c "
           set -e
-          export PATH=/root/.bun/bin:\$PATH
+          export PATH=/root/.bun/bin:/root/.bun/lens/bin:\$PATH
           for bin in bun rg fd; do
             command -v \$bin >/dev/null || { echo \"[ERROR] \$bin missing from the bun-cache volume -- sealed toolchain prep failed\"; exit 1; }
+          done
+          for bin in node pyright-langserver ruff; do
+            command -v \$bin >/dev/null || echo \"[WARN] \$bin missing from the bun-cache volume -- pi-lens Python LSP/lint will be unavailable\"
           done
           source /opt/miniconda3/etc/profile.d/conda.sh
           conda activate testbed
