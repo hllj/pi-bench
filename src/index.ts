@@ -13,12 +13,12 @@ import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
 import { buildJudgePrompt, decideScore, resolveJudgeModel, runJudge } from "./judge-run";
 import { buildAgentPrompt, buildVerificationRetryPrompt } from "./prompts";
-import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
+import { shouldIssueBudgetNudge, trackGitArchaeology, verificationRetryBudgetMs, type ArchaeologyState } from "./loop-guard";
 import { extractDjangoTestModules, validateFailToPass } from "./task-validation";
 import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from "./config-guard";
 import { scrubGitHistoryToOrphanBaseline } from "./git-scrub";
 import { applySweTestPatch, revertAgentTestModifications, revertAndApplySweTestPatch, runSweBenchTestCommand } from "./swe-tests";
-import { detectEgressAttempt, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type EgressAttempt } from "./egress";
+import { detectEgressAttempt, detectEgressAttemptsInDelegation, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type EgressAttempt } from "./egress";
 import { childModelsTarget, delegationKind, skillReadName } from "./subagent-support";
 import { applyGatewayOverrides, GATEWAY_HOST, GATEWAY_PORT, parseGatewaySpec, type GatewayRoute } from "./gateway";
 
@@ -36,7 +36,7 @@ const GATEWAYS = parseGatewaySpec(process.env.PI_BENCH_GATEWAY);
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
-async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[], consumeTask = false, deferGrading = false) {
+async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any, outputDir: string = ".", timeoutMin: number = 30, provider: string = "llama.cpp", port?: string, contextWindowOverride?: number, excludeTools?: string[], consumeTask = false, deferGrading = false, retryTimeoutMin = 10) {
   const taskContent = await readFile(taskFile, "utf-8");
   const task = JSON.parse(taskContent);
   if (consumeTask) {
@@ -235,8 +235,14 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     // Declared here (before the timeout/start below are assigned) but only
     // ever read inside the subscribe callback, which can't fire until
     // session.prompt() runs further down -- by then both are set.
-    let budgetNudgeNeeded = false;
+    // Delivered with session.steer(), NOT abort(): it arrives after the
+    // current turn's tool calls finish. Aborting killed the in-flight tool
+    // (a test run, a subagent) every time -- 29 of 29 nudges in the 0925
+    // sealed run -- and the agent had to redo it.
     let budgetNudgeIssued = false;
+    // The verification retry has its own deadline; the 50% nudge is about the
+    // main phase and must not fire inside it.
+    let inVerificationRetry = false;
 
     // Audit trail of network-fetch attempts (pip download, git clone, curl
     // github/pypi, ...). Enforcement is the sealed network, not this -- see
@@ -245,6 +251,12 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     const egressAttempts: EgressAttempt[] = [];
     const MAX_RECORDED_EGRESS_ATTEMPTS = 20;
     let egressAttemptCount = 0;
+    const recordEgressAttempt = (attempt: EgressAttempt) => {
+      egressAttemptCount++;
+      if (egressAttempts.length < MAX_RECORDED_EGRESS_ATTEMPTS) egressAttempts.push(attempt);
+      const origin = attempt.via ? ` via ${attempt.via}` : "";
+      console.warn(`\n[WARN] Network-fetch attempt (${attempt.category})${origin}: ${attempt.snippet.slice(0, 120)}`);
+    };
     const start = Date.now();
     const timeoutMs = timeoutMin * 60 * 1000;
 
@@ -312,25 +324,33 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
             !loopDetected &&
             !archaeologyNudgeNeeded &&
             !configFileWarningNeeded &&
+            !inVerificationRetry &&
             shouldIssueBudgetNudge(Date.now() - start, timeoutMs, budgetNudgeIssued)
           ) {
-            console.warn(`\n[WARN] 50% of the ${timeoutMin}-minute time budget used. Nudging agent to focus on finishing.`);
-            budgetNudgeNeeded = true;
-            session.abort();
+            budgetNudgeIssued = true;
+            const elapsedMin = Math.round((Date.now() - start) / 60000);
+            console.warn(`\n[WARN] 50% of the ${timeoutMin}-minute time budget used. Steering agent to focus on finishing (the running tool is not interrupted).`);
+            session
+              .steer(`SYSTEM WARNING: You have used over half of your allotted time (${elapsedMin} of ${timeoutMin} minutes). Stop broad exploration now. If you haven't implemented the source-code fix yet, do so immediately. Verify ONLY against the specific failing test(s) described in the task -- do not re-run the full suite or continue investigating tangents.`)
+              .catch((e) => console.warn(`[WARN] Could not queue the time-budget nudge:`, e));
           }
 
           const egressAttempt = detectEgressAttempt(event.toolName, event.args);
-          if (egressAttempt) {
-            egressAttemptCount++;
-            if (egressAttempts.length < MAX_RECORDED_EGRESS_ATTEMPTS) egressAttempts.push(egressAttempt);
-            console.warn(`\n[WARN] Network-fetch attempt (${egressAttempt.category}): ${egressAttempt.snippet.slice(0, 120)}`);
-          }
+          if (egressAttempt) recordEgressAttempt(egressAttempt);
 
           if (argsStr.length > 200) argsStr = argsStr.substring(0, 200) + "...";
         } catch (e) { }
         console.log(`\n[AGENT] Started using tool: ${event.toolName} with args: ${argsStr}`);
       } else if (event.type === "tool_execution_end") {
         console.log(`[AGENT] Finished tool: ${event.toolName}`);
+        // A delegated child's tool calls only become visible here, in the
+        // delegation tool's result details (see src/egress.ts).
+        const delegation = delegationKind(event.toolName);
+        if (delegation) {
+          try {
+            for (const a of detectEgressAttemptsInDelegation((event.result as any)?.details, delegation)) recordEgressAttempt(a);
+          } catch (e) { }
+        }
         if (event.result) {
           try {
             let resStr = typeof event.result === 'string' ? event.result : JSON.stringify(event.result);
@@ -349,40 +369,34 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       setTimeout(() => reject(new Error("AGENT_TIMEOUT")), timeoutMs);
     });
 
-    let timedOut = false;
+    let timedOut = false;       // the main phase hit the --timeout
+    let retryTimedOut = false;  // the verification retry hit its own deadline
 
-    const runPromptWithLoopDetection = async (promptText: string) => {
+    // `deadline` rejects with AGENT_TIMEOUT (main phase) or RETRY_TIMEOUT
+    // (verification retry, which has its own timer -- see below).
+    const runPromptWithLoopDetection = async (promptText: string, deadline: Promise<unknown> = timeoutPromise) => {
       let currentPrompt = promptText;
       let maxLoops = 3;
 
-      while (!timedOut && maxLoops > 0) {
+      while (!timedOut && !retryTimedOut && maxLoops > 0) {
         try {
           await Promise.race([
             session.prompt(currentPrompt),
-            timeoutPromise
+            deadline
           ]);
           if (loopDetected) throw new Error("LOOP_DETECTED");
           if (archaeologyNudgeNeeded) throw new Error("ARCHAEOLOGY_NUDGE");
           if (configFileWarningNeeded) throw new Error("CONFIG_FILE_WARNING");
-          if (budgetNudgeNeeded) throw new Error("BUDGET_NUDGE");
           break; // Finished successfully
         } catch (err: any) {
           if (err.message === "AGENT_TIMEOUT") {
             console.error(`\n[ERROR] Agent execution timed out after ${timeoutMin} minutes. Aborting...`);
             await session.abort();
             timedOut = true;
-          } else if (budgetNudgeNeeded || err.message === "BUDGET_NUDGE") {
-            // Same ordering requirement as the other nudge branches: this also
-            // calls session.abort(), so it MUST be checked before the generic
-            // loop-detected fallback swallows it as a plain abort. One-shot:
-            // budgetNudgeIssued is never cleared, unlike the archaeology/
-            // config-file nudges' per-trigger reset.
-            budgetNudgeNeeded = false;
-            budgetNudgeIssued = true;
-            const elapsedMin = Math.round((Date.now() - start) / 60000);
-            console.log(`\n[INFO] Time-budget nudge (${elapsedMin}/${timeoutMin} min elapsed)... Prompting agent to focus on finishing.`);
-            currentPrompt = `SYSTEM WARNING: You have used over half of your allotted time (${elapsedMin} of ${timeoutMin} minutes). Stop broad exploration now. If you haven't implemented the source-code fix yet, do so immediately. Verify ONLY against the specific failing test(s) described in the task -- do not re-run the full suite or continue investigating tangents.\n\n[Tool results are returned. If the result is sufficient, answer now.]`;
-            maxLoops--;
+          } else if (err.message === "RETRY_TIMEOUT") {
+            console.error(`\n[ERROR] Verification retry ran out of its time allowance. Aborting...`);
+            await session.abort();
+            retryTimedOut = true;
           } else if (configFileWarningNeeded || err.message === "CONFIG_FILE_WARNING") {
             // Same ordering requirement as the archaeology branch below: this
             // also calls session.abort(), so it MUST be checked before the
@@ -529,8 +543,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       diff = await getDiff();
     }
 
-    const duration = Date.now() - start;
-    console.log(`\n--- Agent finished in ${duration}ms ---\n`);
+    const mainPhaseMs = Date.now() - start;
+    console.log(`\n--- Agent finished in ${mainPhaseMs}ms ---\n`);
+    let retryDurationMs = 0;
 
     console.log(`[INFO] Generated diff length: ${diff.length} characters`);
 
@@ -570,10 +585,24 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
         // history call. (archaeologyNudgesUsed is deliberately NOT reset — it
         // is an intentional whole-task budget, not a per-phase one.)
         archaeologyState.count = 0;
+        // Own deadline instead of the main timer: the rest of the main budget,
+        // but at least --retry-timeout minutes (src/loop-guard.ts).
+        const retryBudgetMs = verificationRetryBudgetMs(Date.now() - start, timeoutMs, retryTimeoutMin * 60 * 1000);
+        console.log(`[INFO] Verification retry time allowance: ${Math.round(retryBudgetMs / 1000)}s`);
+        let retryTimer: ReturnType<typeof setTimeout> | undefined;
+        const retryDeadline = new Promise((_, reject) => {
+          retryTimer = setTimeout(() => reject(new Error("RETRY_TIMEOUT")), retryBudgetMs);
+        });
+        const retryStart = Date.now();
+        inVerificationRetry = true;
         try {
-          await runPromptWithLoopDetection(retryPrompt);
+          await runPromptWithLoopDetection(retryPrompt, retryDeadline);
         } catch (err: any) {
-          if (err.message !== "AGENT_TIMEOUT") throw err;
+          if (err.message !== "AGENT_TIMEOUT" && err.message !== "RETRY_TIMEOUT") throw err;
+        } finally {
+          clearTimeout(retryTimer);
+          inVerificationRetry = false;
+          retryDurationMs = Date.now() - retryStart;
         }
 
         lastAssistant = [...session.messages].reverse().find(m => m.role === "assistant") as any;
@@ -691,7 +720,9 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
     }
     const result: any = {
       task: task.id,
-      durationMs: duration,
+      // Agent working time: main phase + verification retry (test runs excluded).
+      durationMs: mainPhaseMs + retryDurationMs,
+      retryDurationMs,
       diff,
       testExitCode,
       testOutput,
@@ -704,6 +735,7 @@ async function runTask(taskFile: string, agentModelReq: any, judgeModelReq: any,
       excludeFromPassRate: scoreSource === "harness-error",
       judgeModel: judgeModel ? `${judgeModel.provider}/${judgeModel.id}` : undefined,
       timedOut,
+      retryTimedOut,
       loopRecoveries,
       verificationRetries,
       archaeologyNudges: archaeologyNudgesUsed,
@@ -764,6 +796,7 @@ async function main() {
       "judge-model": { type: "string" },
       "model-tag": { type: "string" },
       timeout: { type: "string", default: "30" },
+      "retry-timeout": { type: "string", default: "10" },
       context: { type: "string" },
       platform: { type: "string" },
       provider: { type: "string" },
@@ -956,6 +989,8 @@ async function main() {
 
   console.log(`[INFO] Found ${taskFiles.length} tasks to run.`);
   const timeoutMin = parseInt(values.timeout as string, 10) || 30;
+  const retryTimeoutParsed = parseInt(values["retry-timeout"] as string, 10);
+  const retryTimeoutMin = Number.isFinite(retryTimeoutParsed) && retryTimeoutParsed >= 0 ? retryTimeoutParsed : 10;
   const contextWindowOverride = values.context ? parseInt(values.context as string, 10) : undefined;
   if (contextWindowOverride) {
     console.log(`[INFO] Context window override: ${contextWindowOverride} tokens`);
@@ -970,6 +1005,7 @@ async function main() {
     agentModel: agentModelReq ? `${agentModelReq.provider}/${agentModelReq.id}` : undefined,
     judgeModel: judgeModelReq ? `${judgeModelReq.provider}/${judgeModelReq.id}` : "default (same as agent)",
     timeoutMin,
+    retryTimeoutMin,
     excludeTools: excludeTools.length > 0 ? excludeTools : undefined,
   };
   if (values["inference-profile"]) {
@@ -1008,7 +1044,7 @@ async function main() {
       console.warn(`[WARN] Could not pre-parse task file ${f} for resume check.`);
     }
 
-    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools, !!values["consume-task"], !!values["defer-grading"]);
+    const res = await runTask(f, agentModelReq, judgeModelReq, outputDir, timeoutMin, provider, values.port as string, contextWindowOverride, excludeTools, !!values["consume-task"], !!values["defer-grading"], retryTimeoutMin);
     results.push(res);
     if (res.excludeFromPassRate) harnessErrors++;
     else if (res.judgeScore === 1) passed++;

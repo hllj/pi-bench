@@ -73,7 +73,12 @@ export type EgressCategory = "upstream-source" | "package-install" | "http-fetch
 export interface EgressAttempt {
   category: EgressCategory;
   snippet: string;
+  // Set when a delegated child made the call, e.g. "subagent:reviewer".
+  via?: string;
 }
+
+// Tools that run a shell command from args.command.
+const COMMAND_TOOLS = new Set(["bash", "run_test"]);
 
 // Anything that pulls a (possibly newer) copy of the project's source or its
 // history: the reference fix is one `diff` away once this succeeds.
@@ -96,7 +101,7 @@ function stripFileHeredocs(command: string): string {
 // `edit` that writes `mock.patch('requests.get')` into test code is not a
 // network access.
 export function detectEgressAttempt(toolName: string, args: unknown): EgressAttempt | null {
-  if (toolName !== "bash") return null;
+  if (!COMMAND_TOOLS.has(toolName)) return null;
   const command =
     args && typeof args === "object" && typeof (args as any).command === "string"
       ? ((args as any).command as string)
@@ -114,4 +119,33 @@ export function detectEgressAttempt(toolName: string, args: unknown): EgressAtte
   if (!category) return null;
 
   return { category, snippet: command.length > 300 ? command.slice(0, 297) + "..." : command };
+}
+
+// Delegation tools (subagent, workflows) run their children as separate `pi`
+// processes, so a child's tool calls never reach this session's
+// tool_execution_start events -- a subagent's `pip download` would only show
+// up as a proxy denial. The child's message history does come back in the
+// delegation tool's result details (results[].messages[]), so walk it for
+// tool calls, including those of nested delegations.
+export function detectEgressAttemptsInDelegation(details: unknown, via: string): EgressAttempt[] {
+  const found: EgressAttempt[] = [];
+  const seen = new Set<object>();
+  const walk = (node: unknown, label: string, depth: number) => {
+    if (!node || typeof node !== "object" || depth > 24 || seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const x of node) walk(x, label, depth + 1);
+      return;
+    }
+    const o = node as any;
+    const here = typeof o.agent === "string" ? `${via}:${o.agent}` : label;
+    if (o.type === "toolCall" && typeof o.name === "string") {
+      const attempt = detectEgressAttempt(o.name, o.arguments);
+      if (attempt) found.push({ ...attempt, via: here });
+      return;
+    }
+    for (const v of Object.values(o)) walk(v, here, depth + 1);
+  };
+  walk(details, via, 0);
+  return found;
 }

@@ -67,12 +67,41 @@ describe("mergeSealedResult", () => {
     expect(r.task).toBe("t1");
   });
 
-  test("proxy denials of source hosts mark contamination even if the agent's own telemetry is clean", () => {
-    const r = mergeSealedResult({ taskId: "t1", untrusted: { egressAttempts: [] }, grade: passGrade, judge, egress: { denied: ["pypi.org:443", "pypi.org:443", "example.com:80"] } });
+  test("proxy denials of code hosts mark contamination even if the agent's own telemetry is clean", () => {
+    const r = mergeSealedResult({ taskId: "t1", untrusted: { egressAttempts: [] }, grade: passGrade, judge, egress: { denied: ["raw.githubusercontent.com:443", "api.github.com:443", "example.com:80"] } });
     expect(r.egressDeniedByProxy).toBe(3);
-    expect(r.egressDeniedTargets).toEqual(["example.com:80", "pypi.org:443"]);
+    expect(r.egressDeniedTargets).toEqual(["api.github.com:443", "example.com:80", "raw.githubusercontent.com:443"]);
     expect(r.contaminationSuspected).toBe(true);
   });
+
+  test("package-index denials alone are not contamination (pip/tool installers hit them)", () => {
+    const denied = Array(42).fill("pypi.org:443").concat(["files.pythonhosted.org:443"]);
+    const r = mergeSealedResult({ taskId: "t1", untrusted: { egressAttempts: [] }, grade: passGrade, judge, egress: { denied } });
+    expect(r.egressDeniedByProxy).toBe(43);
+    expect(r.contaminationSuspected).toBe(false);
+  });
+
+  test("an upstream-source command attempt still marks contamination", () => {
+    const untrusted = { egressAttempts: [{ category: "upstream-source", snippet: "pip download sphinx==4.1.0 --no-deps" }] };
+    const r = mergeSealedResult({ taskId: "t1", untrusted, grade: passGrade, judge, egress: { denied: ["pypi.org:443"] } });
+    expect(r.contaminationSuspected).toBe(true);
+  });
+  test("a subagent's upstream-source attempt marks contamination and keeps its origin", () => {
+    const untrusted = { egressAttempts: [{ category: "upstream-source", snippet: "pip download sphinx==4.1.0", via: "subagent:reviewer" }] };
+    const r = mergeSealedResult({ taskId: "t1", untrusted, grade: passGrade, judge, egress: { denied: ["pypi.org:443"] } });
+    expect(r.contaminationSuspected).toBe(true);
+    expect(r.egressAttempts[0].via).toBe("subagent:reviewer");
+  });
+
+  test("verification-retry timing is carried over type-checked", () => {
+    const r = mergeSealedResult({ taskId: "t1", untrusted: { diff: "d", retryDurationMs: 540000, retryTimedOut: true }, grade: passGrade, judge, egress: { denied: [] } });
+    expect(r.retryDurationMs).toBe(540000);
+    expect(r.retryTimedOut).toBe(true);
+    const bad = mergeSealedResult({ taskId: "t1", untrusted: { diff: "d", retryDurationMs: "long", retryTimedOut: "yes" }, grade: passGrade, judge, egress: { denied: [] } });
+    expect(bad.retryDurationMs).toBeUndefined();
+    expect(bad.retryTimedOut).toBeUndefined();
+  });
+
   test("skill/delegation telemetry is carried over type-checked", () => {
     const untrusted = { diff: "d", skillsRead: ["dev-workflows", 42], delegationCalls: { subagent: 2, run_dev_workflow: "x" } };
     const r = mergeSealedResult({ taskId: "t1", untrusted, grade: passGrade, judge, egress: { denied: [] } });
