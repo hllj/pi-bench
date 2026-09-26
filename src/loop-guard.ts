@@ -42,3 +42,12 @@ export function shouldIssueBudgetNudge(
   if (alreadyIssued || timeoutMs <= 0) return false;
   return elapsedMs >= timeoutMs * thresholdFraction;
 }
+
+// Time the one-shot verification retry may run: what is left of the main
+// budget, but never less than `retryAllowanceMs`. The retry used to share the
+// main timer, so an agent that finished at 16-25 of 30 minutes got a corrective
+// pass with only minutes left and was killed mid-fix (5 of the 10 timeouts in
+// the 0925 sealed run).
+export function verificationRetryBudgetMs(elapsedMs: number, timeoutMs: number, retryAllowanceMs: number): number {
+  return Math.max(timeoutMs - elapsedMs, retryAllowanceMs, 0);
+}

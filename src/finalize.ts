@@ -19,8 +19,8 @@ import { decideScore } from "./judge-run";
 // the agent and, via the delegation tool's result, from its subagents.
 const SOURCE_HOST_RE = /(^|\.)(github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|readthedocs\.(io|org)):\d+$/i;
 
-const NUMBER_FIELDS = ["durationMs", "loopRecoveries", "verificationRetries", "archaeologyNudges", "egressAttemptCount"];
-const BOOLEAN_FIELDS = ["timedOut", "timeBudgetNudged"];
+const NUMBER_FIELDS = ["durationMs", "retryDurationMs", "loopRecoveries", "verificationRetries", "archaeologyNudges", "egressAttemptCount"];
+const BOOLEAN_FIELDS = ["timedOut", "retryTimedOut", "timeBudgetNudged"];
 
 export interface JudgeSummary {
   judgeScore: number | null;

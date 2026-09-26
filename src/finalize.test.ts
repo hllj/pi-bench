@@ -93,6 +93,15 @@ describe("mergeSealedResult", () => {
     expect(r.egressAttempts[0].via).toBe("subagent:reviewer");
   });
 
+  test("verification-retry timing is carried over type-checked", () => {
+    const r = mergeSealedResult({ taskId: "t1", untrusted: { diff: "d", retryDurationMs: 540000, retryTimedOut: true }, grade: passGrade, judge, egress: { denied: [] } });
+    expect(r.retryDurationMs).toBe(540000);
+    expect(r.retryTimedOut).toBe(true);
+    const bad = mergeSealedResult({ taskId: "t1", untrusted: { diff: "d", retryDurationMs: "long", retryTimedOut: "yes" }, grade: passGrade, judge, egress: { denied: [] } });
+    expect(bad.retryDurationMs).toBeUndefined();
+    expect(bad.retryTimedOut).toBeUndefined();
+  });
+
   test("skill/delegation telemetry is carried over type-checked", () => {
     const untrusted = { diff: "d", skillsRead: ["dev-workflows", 42], delegationCalls: { subagent: 2, run_dev_workflow: "x" } };
     const r = mergeSealedResult({ taskId: "t1", untrusted, grade: passGrade, judge, egress: { denied: [] } });

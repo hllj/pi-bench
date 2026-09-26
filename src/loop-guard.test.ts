@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { shouldIssueBudgetNudge, trackGitArchaeology, type ArchaeologyState } from "./loop-guard";
+import { shouldIssueBudgetNudge, trackGitArchaeology, verificationRetryBudgetMs, type ArchaeologyState } from "./loop-guard";
 
 describe("trackGitArchaeology", () => {
   test("triggers after 3 git-history bash calls with no mutation in between", () => {
@@ -64,5 +64,28 @@ describe("shouldIssueBudgetNudge", () => {
 
   test("false for a zero or negative timeout", () => {
     expect(shouldIssueBudgetNudge(1000, 0, false)).toBe(false);
+  });
+});
+
+describe("verificationRetryBudgetMs", () => {
+  const MIN = 60_000;
+
+  test("keeps the rest of the main budget when that is more than the retry allowance", () => {
+    expect(verificationRetryBudgetMs(8 * MIN, 30 * MIN, 10 * MIN)).toBe(22 * MIN);
+  });
+
+  test("gives at least the retry allowance when the main budget is nearly spent", () => {
+    // 0925 run: agents finishing at 16-25 min got a retry with 5-14 min left
+    // and were killed at 30 min.
+    expect(verificationRetryBudgetMs(25 * MIN, 30 * MIN, 10 * MIN)).toBe(10 * MIN);
+  });
+
+  test("gives the retry allowance even if the main budget is already exceeded", () => {
+    expect(verificationRetryBudgetMs(31 * MIN, 30 * MIN, 10 * MIN)).toBe(10 * MIN);
+  });
+
+  test("a zero allowance falls back to what is left of the main budget", () => {
+    expect(verificationRetryBudgetMs(25 * MIN, 30 * MIN, 0)).toBe(5 * MIN);
+    expect(verificationRetryBudgetMs(31 * MIN, 30 * MIN, 0)).toBe(0);
   });
 });

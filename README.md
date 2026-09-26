@@ -242,6 +242,7 @@ bun run src/index.ts tasks/curated/easy.json
 | `--rocm-version <ver>`| ROCm version running the backend | `7.2.4` |
 | `--context <tokens>` | Override model context window size for this run | From `models.json` |
 | `--timeout <minutes>` | Agent timeout per task | `30` |
+| `--retry-timeout <minutes>` | Minimum time the one-shot verification retry gets (it keeps the rest of `--timeout` if that is longer) | `10` |
 | `--pass <N>` | Number of attempts to make per task (retries on failure) | `1` |
 | `--unsealed` | `run-swe-bench.sh` only: disable sealed mode (agent gets internet + the repo mount). Debugging only | sealed |
 | `--output-dir <dir>` | Write results here instead of the computed `benchmark_results/...` dir | computed |
