@@ -19,14 +19,14 @@
 //     The staged copy filters its `tools:` list with the same exclusions.
 //
 // Agents can also be left out of the staged copy entirely (--exclude-agents,
-// default: reviewer). Across the 0925/0927 sealed runs the reviewer took 173
-// agent-minutes over 23 calls, 9 of them timed out with no verdict, and no
-// task shows a reviewer verdict turning a fail into a pass. Dispatching an
-// excluded agent fails at once ("Unknown agent"), so it costs seconds.
+// default: none). Useful for A/B runs: across the 0925/0927 sealed runs the
+// reviewer took 173 agent-minutes over 23 calls, 9 of them timed out with no
+// verdict -- `--exclude-agents reviewer` measures a run without it.
+// Dispatching an excluded agent fails at once ("Unknown agent").
 
 import { basename, join } from "node:path";
 
-export const DEFAULT_EXCLUDED_AGENTS = ["reviewer"];
+export const DEFAULT_EXCLUDED_AGENTS: string[] = [];
 
 // "none" or an empty value keeps every agent; undefined means the default.
 export function resolveExcludedAgents(raw: string | undefined): string[] {

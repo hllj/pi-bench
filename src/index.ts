@@ -843,7 +843,7 @@ async function main() {
     process.exit(0);
   }
   // Subagent definitions left out of the staged copy (scripts/stage-agents.ts).
-  // Default: reviewer -- see src/subagent-support.ts. "none" keeps them all.
+  // Default: none excluded -- see src/subagent-support.ts.
   const excludeAgents = resolveExcludedAgents(values["exclude-agents"] as string | undefined);
   if (values["print-excluded-agents"]) {
     console.log(excludeAgents.join(","));

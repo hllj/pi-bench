@@ -93,7 +93,7 @@ if [ -d "$AGENT_DIR/agents" ]; then
   STAGED_AGENTS_DIR="$PI_BENCH_DIR/.pi-bench-stage/agents-$$"
   trap 'rm -rf "$STAGED_AGENTS_DIR"' EXIT
   EXCLUDED_TOOLS=$(bun run src/index.ts --print-excluded-tools $EXTRA_ARGS 2>/dev/null || true)
-  # --exclude-agents (default: reviewer) drops whole agent definitions.
+  # --exclude-agents (default: none) drops whole agent definitions.
   EXCLUDED_AGENTS=$(bun run src/index.ts --print-excluded-agents $EXTRA_ARGS 2>/dev/null || true)
   bun run scripts/stage-agents.ts "$AGENT_DIR/agents" "$STAGED_AGENTS_DIR" "$EXCLUDED_TOOLS" "$EXCLUDED_AGENTS"
   RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $STAGED_AGENTS_DIR:/root/.pi/agent/agents:ro"

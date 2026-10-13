@@ -72,8 +72,8 @@ describe("delegationKind", () => {
 });
 
 describe("resolveExcludedAgents", () => {
-  test("defaults to dropping the reviewer", () => {
-    expect(resolveExcludedAgents(undefined)).toEqual(["reviewer"]);
+  test("defaults to keeping every agent (reviewer included)", () => {
+    expect(resolveExcludedAgents(undefined)).toEqual([]);
   });
 
   test("'none' or an empty value keeps every agent", () => {
