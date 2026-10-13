@@ -1,20 +1,21 @@
 // Stages a benchmark-safe copy of ~/.pi/agent/agents for run-swe-bench.sh:
 // symlinks resolved, `model:` overrides dropped (children inherit the
-// benchmarked model), excluded tools removed from `tools:` lists.
-// See src/subagent-support.ts for why.
+// benchmarked model), excluded tools removed from `tools:` lists, excluded
+// agents left out entirely. See src/subagent-support.ts for why.
 //
-// Usage: bun run scripts/stage-agents.ts <src-agents-dir> <dst-dir> <excluded-tools-csv>
+// Usage: bun run scripts/stage-agents.ts <src-agents-dir> <dst-dir> <excluded-tools-csv> [excluded-agents-csv]
 
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { sanitizeAgentDefinition } from "../src/subagent-support";
+import { isAgentExcluded, sanitizeAgentDefinition } from "../src/subagent-support";
 
-const [srcDir, dstDir, excludeCsv = ""] = process.argv.slice(2);
+const [srcDir, dstDir, excludeCsv = "", excludeAgentsCsv = ""] = process.argv.slice(2);
 if (!srcDir || !dstDir) {
-  console.error("Usage: bun run scripts/stage-agents.ts <src-agents-dir> <dst-dir> <excluded-tools-csv>");
+  console.error("Usage: bun run scripts/stage-agents.ts <src-agents-dir> <dst-dir> <excluded-tools-csv> [excluded-agents-csv]");
   process.exit(1);
 }
 const exclude = excludeCsv.split(",").map((t) => t.trim()).filter(Boolean);
+const excludeAgents = excludeAgentsCsv.split(",").map((a) => a.trim()).filter(Boolean);
 
 rmSync(dstDir, { recursive: true, force: true });
 mkdirSync(dstDir, { recursive: true });
@@ -30,7 +31,12 @@ for (const name of readdirSync(srcDir).sort()) {
   }
   if (!isFile || !name.endsWith(".md")) continue;
 
-  const out = sanitizeAgentDefinition(readFileSync(src, "utf-8"), exclude);
+  const content = readFileSync(src, "utf-8");
+  if (isAgentExcluded(name, content, excludeAgents)) {
+    console.error(`[INFO] Agent ${name}: excluded (--exclude-agents), not staged`);
+    continue;
+  }
+  const out = sanitizeAgentDefinition(content, exclude);
   writeFileSync(join(dstDir, name), out.content);
 
   const notes: string[] = [];

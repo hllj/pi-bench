@@ -93,7 +93,9 @@ if [ -d "$AGENT_DIR/agents" ]; then
   STAGED_AGENTS_DIR="$PI_BENCH_DIR/.pi-bench-stage/agents-$$"
   trap 'rm -rf "$STAGED_AGENTS_DIR"' EXIT
   EXCLUDED_TOOLS=$(bun run src/index.ts --print-excluded-tools $EXTRA_ARGS 2>/dev/null || true)
-  bun run scripts/stage-agents.ts "$AGENT_DIR/agents" "$STAGED_AGENTS_DIR" "$EXCLUDED_TOOLS"
+  # --exclude-agents (default: none) drops whole agent definitions.
+  EXCLUDED_AGENTS=$(bun run src/index.ts --print-excluded-agents $EXTRA_ARGS 2>/dev/null || true)
+  bun run scripts/stage-agents.ts "$AGENT_DIR/agents" "$STAGED_AGENTS_DIR" "$EXCLUDED_TOOLS" "$EXCLUDED_AGENTS"
   RESOURCE_MOUNTS="$RESOURCE_MOUNTS -v $STAGED_AGENTS_DIR:/root/.pi/agent/agents:ro"
 fi
 
@@ -183,6 +185,8 @@ echo "========================================================"
 #      ruff) is prepared ONCE up front with network access, into the shared
 #      bun-cache volume. pi-lens's own installer is off in the container
 #      (PI_LENS_DISABLE_TOOL_INSTALL=1): it finds those tools on PATH instead.
+#      Two more things the Python LSP needs in the container, see below
+#      (the pyright symlink into the conda env, and a longer diagnostics wait).
 # ---------------------------------------------------------------------------
 SEALED_NETWORK="pi-bench-sealed"
 EGRESS_CONTAINER="pi-bench-egress"
@@ -349,6 +353,7 @@ json.dump(t, open(sys.argv[2], 'w'))
         -e PI_BENCH_GATEWAY="$GATEWAY_SPEC" \
         -e PI_OFFLINE=1 \
         -e PI_LENS_DISABLE_TOOL_INSTALL=1 \
+        -e PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS=20000 \
         -e HTTP_PROXY="$EGRESS_PROXY_URL" -e HTTPS_PROXY="$EGRESS_PROXY_URL" \
         -e http_proxy="$EGRESS_PROXY_URL" -e https_proxy="$EGRESS_PROXY_URL" \
         -e NO_PROXY="localhost,127.0.0.1,$EGRESS_CONTAINER" -e no_proxy="localhost,127.0.0.1,$EGRESS_CONTAINER" \
@@ -370,6 +375,17 @@ json.dump(t, open(sys.argv[2], 'w'))
           done
           source /opt/miniconda3/etc/profile.d/conda.sh
           conda activate testbed
+          # pi-lens tries project-local pyright first (the conda env's bin/,
+          # then node_modules/.bin). Under bun on Linux a missing binary
+          # 'spawns' and exits 127 instead of failing with ENOENT, which
+          # pi-lens treats as a crashed server: it gives up on Python before
+          # reaching the PATH pyright, and the LSP is never ready. Linking our
+          # pyright into the env makes that first candidate real (and gives it
+          # the testbed interpreter). Outside /testbed, so never in the diff;
+          # the grading container doesn't have it.
+          for t in pyright pyright-langserver; do
+            [ -x /root/.bun/lens/bin/\$t ] && [ -d \"\$CONDA_PREFIX/bin\" ] && ln -sf /root/.bun/lens/bin/\$t \"\$CONDA_PREFIX/bin/\$t\" || true
+          done
           bun run src/index.ts /pi-bench-io/task.json --consume-task --defer-grading --output-dir /pi-bench-io/out $EXTRA_ARGS
         " 2>&1 | tee "$LOGFILE"
       EXIT_CODE=${PIPESTATUS[0]}
