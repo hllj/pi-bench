@@ -19,7 +19,7 @@ import { classifyConfigDiff, extractToolFilePath, isConfigArtifactFile } from ".
 import { scrubGitHistoryToOrphanBaseline } from "./git-scrub";
 import { applySweTestPatch, revertAgentTestModifications, revertAndApplySweTestPatch, runSweBenchTestCommand } from "./swe-tests";
 import { detectEgressAttempt, detectEgressAttemptsInDelegation, egressTargetFromBaseUrl, rewriteLocalBaseUrl, type EgressAttempt } from "./egress";
-import { childModelsTarget, delegationKind, skillReadName } from "./subagent-support";
+import { childModelsTarget, delegationKind, resolveExcludedAgents, skillReadName } from "./subagent-support";
 import { applyGatewayOverrides, GATEWAY_HOST, GATEWAY_PORT, parseGatewaySpec, type GatewayRoute } from "./gateway";
 
 // Hostname that reaches the machine running the local inference server. A
@@ -812,6 +812,8 @@ async function main() {
       "consume-task": { type: "boolean" },
       "defer-grading": { type: "boolean" },
       "exclude-tools": { type: "string" },
+      "exclude-agents": { type: "string" },
+      "print-excluded-agents": { type: "boolean" },
     },
     allowPositionals: true,
   });
@@ -838,6 +840,13 @@ async function main() {
   // definitions (scripts/stage-agents.ts) -- this list only covers the parent.
   if (values["print-excluded-tools"]) {
     console.log(excludeTools.join(","));
+    process.exit(0);
+  }
+  // Subagent definitions left out of the staged copy (scripts/stage-agents.ts).
+  // Default: reviewer -- see src/subagent-support.ts. "none" keeps them all.
+  const excludeAgents = resolveExcludedAgents(values["exclude-agents"] as string | undefined);
+  if (values["print-excluded-agents"]) {
+    console.log(excludeAgents.join(","));
     process.exit(0);
   }
   // console.error, not console.log: --print-output-dir's only stdout contract
@@ -1007,6 +1016,7 @@ async function main() {
     timeoutMin,
     retryTimeoutMin,
     excludeTools: excludeTools.length > 0 ? excludeTools : undefined,
+    excludeAgents: excludeAgents.length > 0 ? excludeAgents : undefined,
   };
   if (values["inference-profile"]) {
     runMeta.inferenceProfile = values["inference-profile"];

@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { childModelsTarget, delegationKind, sanitizeAgentDefinition, skillReadName } from "./subagent-support";
+import {
+  childModelsTarget,
+  delegationKind,
+  isAgentExcluded,
+  resolveExcludedAgents,
+  sanitizeAgentDefinition,
+  skillReadName,
+} from "./subagent-support";
 
 const EXCLUDE = ["web_search", "web_fetch", "question", "questionnaire"];
 
@@ -61,6 +68,39 @@ describe("delegationKind", () => {
     expect(delegationKind("run_dev_workflow")).toBe("run_dev_workflow");
     expect(delegationKind("run_workflow")).toBe("run_workflow");
     expect(delegationKind("bash")).toBeNull();
+  });
+});
+
+describe("resolveExcludedAgents", () => {
+  test("defaults to dropping the reviewer", () => {
+    expect(resolveExcludedAgents(undefined)).toEqual(["reviewer"]);
+  });
+
+  test("'none' or an empty value keeps every agent", () => {
+    expect(resolveExcludedAgents("none")).toEqual([]);
+    expect(resolveExcludedAgents("NONE")).toEqual([]);
+    expect(resolveExcludedAgents("  ")).toEqual([]);
+  });
+
+  test("parses a comma-separated list", () => {
+    expect(resolveExcludedAgents("reviewer, planner,,")).toEqual(["reviewer", "planner"]);
+  });
+});
+
+describe("isAgentExcluded", () => {
+  const reviewer = "---\nname: reviewer\ndescription: x\n---\nbody";
+
+  test("matches the frontmatter name", () => {
+    expect(isAgentExcluded("code-review.md", reviewer, ["reviewer"])).toBe(true);
+  });
+
+  test("matches the file name when the frontmatter has no name", () => {
+    expect(isAgentExcluded("reviewer.md", "no frontmatter", ["reviewer"])).toBe(true);
+  });
+
+  test("keeps agents that are not listed", () => {
+    expect(isAgentExcluded("scout.md", "---\nname: scout\n---\n", ["reviewer"])).toBe(false);
+    expect(isAgentExcluded("reviewer.md", reviewer, [])).toBe(false);
   });
 });
 

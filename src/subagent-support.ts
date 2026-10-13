@@ -17,8 +17,33 @@
 //  3. Tool exclusions. --exclude-tools applies to the parent session only; an
 //     agent file listing web_search/web_fetch would hand them to the child.
 //     The staged copy filters its `tools:` list with the same exclusions.
+//
+// Agents can also be left out of the staged copy entirely (--exclude-agents,
+// default: reviewer). Across the 0925/0927 sealed runs the reviewer took 173
+// agent-minutes over 23 calls, 9 of them timed out with no verdict, and no
+// task shows a reviewer verdict turning a fail into a pass. Dispatching an
+// excluded agent fails at once ("Unknown agent"), so it costs seconds.
 
-import { join } from "node:path";
+import { basename, join } from "node:path";
+
+export const DEFAULT_EXCLUDED_AGENTS = ["reviewer"];
+
+// "none" or an empty value keeps every agent; undefined means the default.
+export function resolveExcludedAgents(raw: string | undefined): string[] {
+  if (raw === undefined) return [...DEFAULT_EXCLUDED_AGENTS];
+  const trimmed = raw.trim();
+  if (trimmed === "" || trimmed.toLowerCase() === "none") return [];
+  return trimmed.split(",").map((a) => a.trim()).filter(Boolean);
+}
+
+// Matches the agent's frontmatter `name:` (what `subagent` dispatches by) or,
+// failing that, the file name.
+export function isAgentExcluded(fileName: string, content: string, excludeAgents: string[]): boolean {
+  if (excludeAgents.length === 0) return false;
+  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---(\r?\n|$)/);
+  const name = fm?.[1].match(/^name:\s*(.+?)\s*$/m)?.[1];
+  return excludeAgents.includes(name ?? basename(fileName, ".md"));
+}
 
 export interface SanitizedAgent {
   content: string;
